@@ -2682,7 +2682,6 @@ __all__ = [
     "reset_worktree_to_head_for_harbor",
     "validate_patch",
     "validate_patch_applies_cleanly",
-    "validate_patch_with_git",
     "_extract_patch_paths",
     "_infer_test_path",
     "_diff_uses_callsite_clone_workaround",
