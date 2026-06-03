@@ -7,63 +7,46 @@ import random
 import re
 import shlex
 import subprocess
+import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 import requests
 
-# ---------------------------------------------------------------------------
-# Environment Bootstrap & Configuration
-# ---------------------------------------------------------------------------
-# This section initializes global configuration variables from the environment.
-# These variables control agent timeouts, run identifiers for tracking, and
-# connection settings for the LLM inference proxy.
 
-# AGENT_TIMEOUT is provided by the Harbor evaluation environment. It sets the
-# strict upper bound on how long the agent can run before being terminated.
 AGENT_TIMEOUT = os.getenv("AGENT_TIMEOUT")
 AGENT_TIMEOUT_SEC = float(AGENT_TIMEOUT) if AGENT_TIMEOUT else None
-
-# EVALUATION_RUN_ID uniquely identifies the current task execution in Harbor.
-# Used for logging and seeding to ensure reproducibility within the same run.
 RUN_ID = os.getenv("EVALUATION_RUN_ID")
 if not RUN_ID:
     print("[AGENT] WARNING: RUN_ID (EVALUATION_RUN_ID) is not set")
 
-# Timeouts for the HTTP requests to the inference endpoint (typically chutes_proxy.py).
 LLM_CONNECT_TIMEOUT = int(os.getenv("LLM_CONNECT_TIMEOUT", "30"))
-LLM_READ_TIMEOUT = int(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
-
-# Maximum time allowed for compiling python code to check for syntax errors.
+LLM_READ_TIMEOUT = int(os.getenv("LLM_REQUEST_TIMEOUT", "130"))
 _PY_COMPILE_TIMEOUT_SEC = 25
 
-# Model alias maps: skarkix model name → proxy-facing model id.
-# chutes_proxy.py then maps these to the actual Chutes TEE endpoints.
-#
-# Active models (as of current config):
-#   Planning : moonshotai/Kimi-K2.5   → kimi-k2.5-tee   (Chutes)
-#   Execution: MiniMaxAI/MiniMax-M2.5 → minimax-m2.5-tee (Chutes)
-#   Fast     : Qwen/Qwen3-Coder-Next  → qwen3-coder-next-tee (Chutes)
-_MODEL_ALIASES: dict[str, str] = {
-    "moonshotai/Kimi-K2.5": "moonshotai/kimi-k2.5",
-    "MiniMaxAI/MiniMax-M2.5": "minimax/minimax-m2.5",
-    "Qwen/Qwen3-Coder-Next": "qwen/qwen3-coder-next",
+_GATEWAY_TO_CHUTES_MODEL: Dict[str, str] = {
+    "deepseek-ai/DeepSeek-R1-0528": "deepseek/deepseek-r1-0528",
+    "zai-org/GLM-4.6": "z-ai/glm-4.6",
+    "zai-org/GLM-4.6-FP8": "z-ai/glm-4.6",
+    "zai-org/GLM-4.7": "z-ai/glm-4.7",
+    "zai-org/GLM-4.7-FP8": "z-ai/glm-4.7",
+    "zai-org/GLM-5-FP8": "z-ai/glm-5",
+    "Qwen/Qwen3-Coder-Next": "Qwen/Qwen3-Coder-Next-TEE",
+    "Qwen/Qwen3.5-397B-A17B": "qwen/qwen3.5-397b-a17b",
+    "moonshotai/Kimi-K2.5": "moonshotai/Kimi-K2.5-TEE",
+    "MiniMaxAI/MiniMax-M2.5": "MiniMaxAI/MiniMax-M2.5-TEE",
+    "anthropic/claude-opus-4.7": "anthropic/claude-opus-4.7"
 }
 
 _DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
-_EMBEDDING_ALIASES: dict[str, str] = {
-    _DEFAULT_EMBEDDING_MODEL: "qwen/qwen3-embedding-8b",
+_GATEWAY_TO_CHUTES_EMBEDDING: Dict[str, str] = {
+    _DEFAULT_EMBEDDING_MODEL: "Qwen/Qwen3-Embedding-8B-TEE",
 }
 
 def _agent_assumed_wall_sec() -> Optional[float]:
-    """
-    Provides a fallback wall-clock limit when the AGENT_TIMEOUT environment
-    variable isn't injected by the host system. Harbor typically caps runs
-    at ~600 seconds, so we default to 600.0 to prevent the agent from
-    hanging indefinitely if it loses track of time.
-    """
+    """Wall-clock fallback when AGENT_TIMEOUT isn't injected (Harbor cap is ~600s)."""
     raw = (os.getenv("RIDGES_AGENT_ASSUMED_WALL_SEC") or "").strip().lower()
     if raw in ("0", "none", "off", "inf", "infinity"):
-        return None  # Explicitly disable the timeout
+        return None
     if raw:
         try:
             v = float(raw)
@@ -74,11 +57,6 @@ def _agent_assumed_wall_sec() -> Optional[float]:
 
 
 def _effective_agent_wall_sec() -> Optional[float]:
-    """
-    Determines the definitive time limit for the agent's execution.
-    Prioritizes the exact AGENT_TIMEOUT provided by the environment,
-    falling back to the assumed limit if necessary.
-    """
     if AGENT_TIMEOUT_SEC is not None:
         return float(AGENT_TIMEOUT_SEC)
     return _agent_assumed_wall_sec()
@@ -104,48 +82,28 @@ def _pretimeout_trigger_sec() -> float:
 
 
 
-def _resolve_model(name: str) -> str:
-    """
-    Maps an internal agent model name (e.g., 'MiniMaxAI/MiniMax-M2.5') to the
-    identifier expected by our local proxy (e.g., 'minimax/minimax-m2.5').
-    If no alias is defined, passes the name through unchanged.
-    """
-    return _MODEL_ALIASES.get(name, name)
+def _resolve_model_for_local(name: str) -> str:
+    return _GATEWAY_TO_CHUTES_MODEL.get(name, name)
 
 
-def _resolve_embedding(name: str) -> str:
-    """
-    Maps an internal embedding model name to the identifier expected by the proxy.
-    """
-    return _EMBEDDING_ALIASES.get(name, name)
+def _resolve_embedding_for_local(name: str) -> str:
+    return _GATEWAY_TO_CHUTES_EMBEDDING.get(name, name)
 
 
-def _inference_api_key() -> str | None:
-    """
-    Retrieves the API key for the inference endpoint. When pointing to the local
-    chutes_proxy.py, this can be a dummy value, as the proxy injects the real
-    Chutes API key.
-    """
-    return os.getenv("RIDGES_INFERENCE_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+def _chutes_api_key() -> str | None:
+    return os.getenv("CHUTES_API_KEY") or os.getenv("RIDGES_INFERENCE_API_KEY")
 
 
-def _inference_base_url() -> str:
-    """
-    Retrieves the base URL for LLM inference. In production/evaluation, this
-    should point to the local proxy (e.g., http://host.docker.internal:8000/v1)
-    which then forwards requests to the secure TEE endpoints.
-    """
+def _chutes_base_url() -> str:
     return (
-        os.getenv("RIDGES_INFERENCE_BASE_URL")
-        or os.getenv("OPENROUTER_BASE_URL")
-        or "https://openrouter.ai/api/v1"
+        os.getenv("CHUTES_BASE_URL")
+        or os.getenv("RIDGES_INFERENCE_BASE_URL")
+        or "https://chutes.ai/api/v1"
     ).rstrip("/")
 
 
-if not _inference_api_key():
-    print("[AGENT] WARNING: No inference API key configured. Set RIDGES_INFERENCE_API_KEY.")
-
-_MAX_OUTPUT_TOKENS = int(os.getenv("RIDGES_AGENT_MAX_OUTPUT_TOKENS", "4096"))
+if not _chutes_api_key():
+    print("[AGENT] WARNING: No inference route configured. Set CHUTES_API_KEY.")
 
 def _retry_sleep_after_rate_limit(attempt: int) -> None:
     wait = min(0.3 * (2 ** attempt) + random.uniform(0, 0.5), 5.0)
@@ -192,7 +150,6 @@ def _wrap_with_cache_control(role: str, text: str) -> dict[str, Any]:
 def _apply_prompt_cache_markers(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not _prompt_cache_enabled():
         return messages
-    # Find last user message index (where conversation history ends).
     last_user_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
         if messages[idx].get("role") == "user" and isinstance(messages[idx].get("content"), str):
@@ -212,51 +169,61 @@ def _apply_prompt_cache_markers(messages: list[dict[str, Any]]) -> list[dict[str
     return out
 
 
-# ---------------------------------------------------------------------------
-# HTTP retry helper (shared by inference and embedding)
-# ---------------------------------------------------------------------------
-
-_RETRIABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
-_HTTP_MAX_ATTEMPTS = 5  # 1 initial + 4 retries
-
-
-def _post_with_retry(
-    url: str,
-    payload: dict[str, Any],
-    headers: dict[str, str],
-    timeout: tuple[int, int],
-    caller: str,
-) -> "requests.Response | None":
-    """
-    Executes an HTTP POST request to the inference endpoint (typically the local proxy)
-    with robust error handling and exponential back-off.
-    
-    This handles common failure modes when interfacing with LLM providers:
-      - 429 (Too Many Requests): Automatically respects the 'Retry-After' header if present,
-        otherwise uses an exponential back-off (1s, 2s, 4s...) to prevent hammering the API.
-      - 5xx / Transient (e.g., 502 Bad Gateway, 504 Timeout): Retries with jittered back-off
-        as these are often temporary issues with the model provider's infrastructure.
-      - Connection/Timeout Errors: Retries transparently.
-
-    Args:
-        url: The endpoint to POST to.
-        payload: JSON payload (e.g., the chat completion request).
-        headers: HTTP headers (including Authorization).
-        timeout: Tuple of (connect_timeout, read_timeout) in seconds.
-        caller: String identifying the caller (e.g., 'inference()') for logging.
+def inference(
+    model,
+    temperature,
+    messages,
+    *,
+    top_p: float | None = None,
+    seed: int | None = None,
+):
+    """Chat completion through the Chutes-compatible endpoint.
 
     Returns:
-        The successful `requests.Response` object (status 200), or `None` if all
-        retry attempts are exhausted or a non-retriable error occurs.
+        tuple: (response_text, usage_dict) where usage_dict contains
+               prompt_tokens, completion_tokens, total_tokens.
+               Returns (None, None) on failure.
+
+    ``seed`` / ``top_p`` are passed when set (OpenAI-compatible); providers may ignore them.
     """
+    timeout = (LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT)
+    api_key = _chutes_api_key()
+    if not api_key:
+        print("[AGENT] inference(): missing CHUTES_API_KEY")
+        return None, None
+
+    resolved = _resolve_model_for_local(model)
+    url = f"{_chutes_base_url()}/chat/completions"
+    payload: dict[str, Any] = {
+        "model": resolved,
+        "messages": _apply_prompt_cache_markers(messages),
+        "temperature": temperature,
+    }
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if seed is not None:
+        payload["seed"] = int(seed)
+    mt = os.getenv("RIDGES_AGENT_MAX_OUTPUT_TOKENS", "").strip()
+    if mt.isdigit():
+        payload["max_tokens"] = int(mt)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    seed_note = f", seed={payload['seed']}" if "seed" in payload else ""
+    top_p_note = f", top_p={payload['top_p']}" if "top_p" in payload else ""
+    print(
+        f"[AGENT] inference(): Chutes endpoint model={resolved} (from {model}), "
+        f"temperature={temperature}{top_p_note}{seed_note}, {len(messages)} messages"
+    )
+
     wait = 1.0
     max_wait = 60.0
-    last_attempt = _HTTP_MAX_ATTEMPTS - 1
-
-    for attempt in range(_HTTP_MAX_ATTEMPTS):
+    last_attempt = 4
+    attempt = 0
+    while attempt <= last_attempt:
         try:
-            response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-
+            response = requests.post(url, json=payload, timeout=timeout, headers=headers)
             if response.status_code == 429 and attempt < last_attempt:
                 retry_after = response.headers.get("Retry-After")
                 slept = False
@@ -269,232 +236,169 @@ def _post_with_retry(
                 if not slept:
                     time.sleep(wait)
                 wait = min(wait * 2, max_wait)
-                print(f"[AGENT] {caller}: HTTP 429, retrying ({attempt + 2}/{_HTTP_MAX_ATTEMPTS})...")
+                print(f"[AGENT] inference(): HTTP 429, retrying (attempt {attempt + 2}/5)...")
+                attempt += 1
                 continue
-
             if response.status_code != 200:
-                if response.status_code in _RETRIABLE_STATUS and attempt < last_attempt:
+                retriable = response.status_code in (408, 425, 429, 500, 502, 503, 504)
+                if retriable and attempt < last_attempt:
                     print(
-                        f"[AGENT] {caller}: HTTP {response.status_code}, "
-                        f"retrying ({attempt + 2}/{_HTTP_MAX_ATTEMPTS})..."
+                        f"[AGENT] inference(): HTTP {response.status_code}, retrying "
+                        f"(attempt {attempt + 2}/{last_attempt + 1})..."
                     )
                     _retry_sleep_after_rate_limit(attempt)
+                    attempt += 1
                     continue
                 print(
-                    f"[AGENT] {caller}: request failed with status "
-                    f"{response.status_code}: {response.text[:800]}"
+                    f"[AGENT] inference(): Inference failed with status {response.status_code}: "
+                    f"{response.text[:800]}"
                 )
-                return None
-
-            return response
-
+                return None, None
+            data = response.json()
+            message = (data.get("choices") or [{}])[0].get("message") or {}
+            result = (message.get("content") or "").strip()
+            print(f"[AGENT] inference(): Inference response: {len(result)} characters")
+            usage = data.get("usage", {})
+            details = usage.get("prompt_tokens_details") or {}
+            cached_tokens = (
+                details.get("cached_tokens")
+                or usage.get("cache_read_input_tokens")
+                or 0
+            )
+            usage_info = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+                "cached_tokens": cached_tokens,
+            }
+            if usage_info["total_tokens"] > 0:
+                cache_suffix = f" cached={cached_tokens}" if cached_tokens else ""
+                print(f"[AGENT] inference(): Token usage: {usage_info}{cache_suffix}")
+            return result or None, usage_info
         except requests.exceptions.Timeout as exc:
-            print(f"[AGENT] {caller}: request timeout: {exc}")
+            print(f"[AGENT] inference(): Request timeout: {exc}")
             if attempt < last_attempt:
                 _retry_sleep_after_rate_limit(attempt)
+                attempt += 1
                 continue
-            return None
+            return None, None
         except requests.exceptions.ConnectionError as exc:
-            print(f"[AGENT] {caller}: connection error: {exc}")
+            print(f"[AGENT] inference(): Connection error: {exc}")
             if attempt < last_attempt:
                 _retry_sleep_after_rate_limit(attempt)
+                attempt += 1
                 continue
-            return None
+            return None, None
         except (ValueError, json.JSONDecodeError) as exc:
-            print(f"[AGENT] {caller}: invalid JSON in response: {exc}")
-            return None
+            print(f"[AGENT] inference(): Invalid JSON in response: {exc}")
+            return None, None
         except Exception as exc:
-            print(f"[AGENT] {caller}: unexpected error: {exc}")
-            return None
+            print(f"[AGENT] inference(): Inference request failed: {exc}")
+            return None, None
 
-    return None
+    return None, None
 
 
-def inference(
-    model: str,
-    temperature: float,
-    messages: list[dict[str, Any]],
-    *,
-    top_p: float | None = None,
-    seed: int | None = None,
-):
-    """
-    Main entry point for generating chat completions via the configured inference provider.
-    
-    This function formats the request into the OpenAI-compatible standard, resolves the 
-    model alias, and delegates to `_post_with_retry` for robust execution. It also handles
-    the extraction of token usage details (including cached token metrics, which are 
-    critical for monitoring the efficiency of our prompt caching strategy).
-
-    Args:
-        model: The internal name of the model to use (e.g., 'MiniMaxAI/MiniMax-M2.5').
-        temperature: Controls randomness in the output (0.0 for deterministic).
-        messages: The conversation history, formatted as a list of role/content dictionaries.
-        top_p: Nucleus sampling parameter (optional).
-        seed: Random seed for reproducible outputs (optional; providers may ignore this).
-
-    Returns:
-        A tuple of `(response_text, usage_dict)`:
-          - `response_text`: The string content generated by the model.
-          - `usage_dict`: A dictionary containing 'prompt_tokens', 'completion_tokens',
-            'total_tokens', and 'cached_tokens'.
-        Returns `(None, None)` if the request fails after all retries.
-    """
-    api_key = _inference_api_key()
+def embedding(input):
+    """Embeddings through the Chutes-compatible endpoint."""
+    timeout = (LLM_CONNECT_TIMEOUT, min(LLM_READ_TIMEOUT, 120))
+    model = os.getenv("RIDGES_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
+    api_key = _chutes_api_key()
     if not api_key:
-        print("[AGENT] inference(): no API key configured")
-        return None, None
-
-    resolved = _resolve_model(model)
-    url = f"{_inference_base_url()}/chat/completions"
-    payload: dict[str, Any] = {
-        "model": resolved,
-        "messages": _apply_prompt_cache_markers(messages),
-        "temperature": temperature,
-        "max_tokens": _MAX_OUTPUT_TOKENS,
-    }
-    if top_p is not None:
-        payload["top_p"] = top_p
-    if seed is not None:
-        payload["seed"] = int(seed)
-
-    seed_note = f", seed={payload['seed']}" if "seed" in payload else ""
-    top_p_note = f", top_p={payload['top_p']}" if "top_p" in payload else ""
-    print(
-        f"[AGENT] inference(): model={resolved} (from {model}), "
-        f"temperature={temperature}{top_p_note}{seed_note}, {len(messages)} messages"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    response = _post_with_retry(
-        url, payload, headers,
-        timeout=(LLM_CONNECT_TIMEOUT, LLM_READ_TIMEOUT),
-        caller="inference()",
-    )
-    if response is None:
-        return None, None
-
-    data = response.json()
-    message = (data.get("choices") or [{}])[0].get("message") or {}
-    result = (message.get("content") or "").strip()
-    print(f"[AGENT] inference(): response {len(result)} chars")
-
-    usage = data.get("usage", {})
-    details = usage.get("prompt_tokens_details") or {}
-    cached_tokens = (
-        details.get("cached_tokens")
-        or usage.get("cache_read_input_tokens")
-        or 0
-    )
-    usage_info = {
-        "prompt_tokens": usage.get("prompt_tokens", 0),
-        "completion_tokens": usage.get("completion_tokens", 0),
-        "total_tokens": usage.get("total_tokens", 0),
-        "cached_tokens": cached_tokens,
-    }
-    if usage_info["total_tokens"] > 0:
-        cache_suffix = f" cached={cached_tokens}" if cached_tokens else ""
-        print(f"[AGENT] inference(): token usage: {usage_info}{cache_suffix}")
-
-    _save_trace(messages, result)
-    return result or None, usage_info
-
-
-def _save_trace(messages: list[dict[str, Any]], result: str) -> None:
-    """Persist a request/response trace to the agent log directory."""
-    try:
-        trace_dir = "/logs/agent/skarkix_traces"
-        os.makedirs(trace_dir, exist_ok=True)
-        trace_file = os.path.join(trace_dir, f"trace_{int(time.time() * 1000)}.json")
-        with open(trace_file, "w") as f:
-            json.dump({"messages": messages, "response": result}, f, indent=2)
-    except Exception as exc:
-        print(f"[AGENT] _save_trace(): {exc}")
-
-
-
-def embedding(input: str | list[str]) -> list[float] | None:
-    """
-    Generates vector embeddings for the provided input text using the configured
-    embedding model. 
-    
-    This is used by the agent during complex search/retrieval tasks to perform
-    semantic search over the codebase when exact keyword matches fail. Like
-    `inference()`, it delegates to `_post_with_retry` for robust execution.
-
-    Args:
-        input: The text string (or list of strings) to embed.
-
-    Returns:
-        A list of floats representing the embedding vector, or None if the request fails.
-    """
-    api_key = _inference_api_key()
-    if not api_key:
-        print("[AGENT] embedding(): no API key configured")
+        print("[AGENT] embedding(): missing CHUTES_API_KEY")
         return None
 
-    model = os.getenv("RIDGES_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
-    resolved = _resolve_embedding(model)
-    url = f"{_inference_base_url()}/embeddings"
-    print(f"[AGENT] embedding(): model={resolved}")
-
+    resolved = _resolve_embedding_for_local(model)
     payload = {"model": resolved, "input": input}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    response = _post_with_retry(
-        url, payload, headers,
-        timeout=(LLM_CONNECT_TIMEOUT, min(LLM_READ_TIMEOUT, 120)),
-        caller="embedding()",
-    )
-    if response is None:
-        return None
+    url = f"{_chutes_base_url()}/embeddings"
+    print(f"[AGENT] embedding(): Chutes endpoint model={resolved}")
 
-    data = response.json()
-    row = (data.get("data") or [{}])[0]
-    result = row.get("embedding")
-    if not isinstance(result, list):
-        print("[AGENT] embedding(): unexpected response shape")
-        return None
-    print(f"[AGENT] embedding(): {len(result)} dimensions")
-    return result
+    last_attempt = 4
+    attempt = 0
+    wait = 1.0
+    max_wait = 60.0
+    while attempt <= last_attempt:
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            if response.status_code == 429 and attempt < last_attempt:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        time.sleep(float(retry_after))
+                    except ValueError:
+                        time.sleep(wait)
+                else:
+                    time.sleep(wait)
+                wait = min(wait * 2, max_wait)
+                print(f"[AGENT] embedding(): HTTP 429, retrying (attempt {attempt + 2}/5)...")
+                attempt += 1
+                continue
+            if response.status_code != 200:
+                retriable = response.status_code in (408, 425, 429, 500, 502, 503, 504)
+                if retriable and attempt < last_attempt:
+                    print(
+                        f"[AGENT] embedding(): HTTP {response.status_code}, retrying "
+                        f"(attempt {attempt + 2}/{last_attempt + 1})..."
+                    )
+                    _retry_sleep_after_rate_limit(attempt)
+                    attempt += 1
+                    continue
+                print(
+                    f"[AGENT] embedding(): failed status {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+                return None
+            data = response.json()
+            row = (data.get("data") or [{}])[0]
+            result = row.get("embedding")
+            if not isinstance(result, list):
+                print("[AGENT] embedding(): unexpected response shape")
+                return None
+            print(f"[AGENT] embedding(): Embedding response: {len(result)} dimensions")
+            return result
+        except requests.exceptions.Timeout as exc:
+            print(f"[AGENT] embedding(): Request timeout: {exc}")
+            if attempt < last_attempt:
+                _retry_sleep_after_rate_limit(attempt)
+                attempt += 1
+                continue
+            return None
+        except requests.exceptions.ConnectionError as exc:
+            print(f"[AGENT] embedding(): Connection error: {exc}")
+            if attempt < last_attempt:
+                _retry_sleep_after_rate_limit(attempt)
+                attempt += 1
+                continue
+            return None
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"[AGENT] embedding(): Invalid JSON in response: {exc}")
+            return None
+        except Exception as e:
+            print(f"[AGENT] embedding(): Embedding request failed: {e}")
+            return None
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Agent Configuration & Defaults
-# ---------------------------------------------------------------------------
-# These variables define the default model roles when not explicitly overridden
-# by the Harbor evaluation environment via environment variables.
 
-# PLANNING_MODEL is used for the initial "thought/planning" phase before execution.
-# Requires strong reasoning capabilities (e.g. Kimi-K2.5 or Claude 3.5 Sonnet).
-PLANNING_MODEL = os.getenv("RIDGES_PLANNING_MODEL", "moonshotai/Kimi-K2.5")
-
-# DEFAULT_MODEL is the primary execution workhorse that iterates on the code.
-# Requires strong coding capabilities and tool-use adherence.
+PLANNING_MODEL = os.getenv("RIDGES_PLANNING_MODEL", "anthropic/claude-opus-4.7")
 DEFAULT_MODEL = os.getenv("RIDGES_AGENT_MODEL", "MiniMaxAI/MiniMax-M2.5")
-
-# FAST_MODEL is used for simple/rapid tasks (e.g., summarizing lint errors).
 FAST_MODEL = os.getenv("RIDGES_AGENT_FAST_MODEL", "Qwen/Qwen3-Coder-Next")
-
-# Global cost limits. The agent tracks its spending using MODEL_PRICING.
 _DEFAULT_COST_RAW = os.getenv("RIDGES_MAX_COST_USD", "0.29") or "0.29"
 DEFAULT_COST_LIMIT = float(_DEFAULT_COST_RAW)
-
-# Skip the expensive planning phase if the total sandbox budget is too small.
 _PLANNING_MIN_COST_USD = float(os.getenv("RIDGES_PLANNING_MIN_COST_USD", "0.12"))
 
 
 class AgentConfig:
-    """
-    Encapsulates all runtime configuration for a single execution of the coding agent.
-    
-    This includes model selection, context limits, retry policies, and budgets. It is 
-    instantiated once per task run by the main agent loop.
+    """Runtime configuration for the coding agent.
 
     Intentionally NOT a @dataclass because the Ridges miner runtime loads
     agent.py via importlib.util dynamically and @dataclass fails when the
@@ -520,7 +424,6 @@ class AgentConfig:
         cost_limit: float = DEFAULT_COST_LIMIT,
         enable_planning: bool = True,
     ):
-        # Legacy ``model=`` kwarg maps to execution_model.
         exec_model = execution_model or model or DEFAULT_MODEL
         self.planning_model = planning_model
         self.execution_model = exec_model
@@ -549,28 +452,26 @@ class AgentConfig:
         return self.execution_model
 
 
-# ---------------------------------------------------------------------------
-# Model Pricing (cost per 1M tokens)
-# ---------------------------------------------------------------------------
 
-# Pricing per 1M tokens (input, output) — keys use the canonical alias name.
-# get_model_pricing() resolves aliases before lookup, so only one entry per model needed.
 MODEL_PRICING: dict[str, tuple[float, float]] = {
-    "moonshotai/kimi-k2.5": (0.14, 0.55),    # planning model  (Chutes Kimi-K2.5-TEE)
-    "minimax/minimax-m2.5": (0.15, 1.15),    # execution model (Chutes MiniMax-M2.5-TEE)
-    "qwen/qwen3-coder-next": (0.11, 0.80),   # fast model      (Chutes Qwen3-Coder-Next-TEE)
-    "qwen/qwen3-embedding-8b": (0.01, 0.01), # embedding model (Chutes Qwen3-Embedding-8B-TEE)
+    "minimax/minimax-m2.5": (0.15, 1.15),
+    "MiniMaxAI/MiniMax-M2.5": (0.15, 1.15),
+    "qwen/qwen3-coder-next": (0.11, 0.8),
+    "Qwen/Qwen3-Coder-Next": (0.11, 0.8),
+    "qwen/qwen3-embedding-8b": (0.01, 0.01),
+    "anthropic/claude-opus-4.7": (5.0, 25.0),
+    "anthropic/claude-sonnet-4.5": (3.0, 15.0),
 }
 
 
 def _models_equivalent(a: str, b: str) -> bool:
-    """True when two model ids refer to the same inference endpoint."""
-    return _resolve_model(a) == _resolve_model(b)
+    """True when two model ids refer to the same Chutes endpoint."""
+    return _resolve_model_for_local(a) == _resolve_model_for_local(b)
 
 
 def get_model_pricing(model: str) -> tuple[float, float]:
     """Return (input_price, output_price) per 1M tokens for a model."""
-    resolved = _resolve_model(model)
+    resolved = _resolve_model_for_local(model)
     for candidate in (model, resolved):
         if candidate in MODEL_PRICING:
             return MODEL_PRICING[candidate]
@@ -583,127 +484,94 @@ def get_model_pricing(model: str) -> tuple[float, float]:
     return (1.0, 2.0)
 
 
-# ---------------------------------------------------------------------------
-# Prompt Templates
-# ---------------------------------------------------------------------------
 
 
-MINI_ACTION_REGEX_RSWEA = re.compile(
-    r"```\s*rswea_bash_command\s*\n(.*?)\n\s*```",
+ACTION_REGEX_SHELL = re.compile(
+    r"(?:```\s*skarkix_shell|<skarkix_shell>)\s*\n(.*?)\n\s*(?:```|</skarkix_shell>)",
     re.DOTALL | re.IGNORECASE,
 )
-MINI_ACTION_REGEX_BASH = re.compile(r"```\s*bash\s*\n(.*?)\n\s*```", re.DOTALL | re.IGNORECASE)
+ACTION_REGEX_FALLBACK_BASH = re.compile(
+    r"(?:```\s*bash|<bash>)\s*\n(.*?)\n\s*(?:```|</bash>)", 
+    re.DOTALL | re.IGNORECASE
+)
 
-# Custom robust-edit block. Lets the model do exact str-replace edits without
-# the quoting hell of sed/here-doc round-trips. Parsed & dispatched in
-# ``CodingAgent._run_action`` BEFORE shell execution.
 EDIT_ACTION_REGEX = re.compile(
-    r"```\s*apply_str_replace\s*\n(.*?)\n\s*```",
+    r"(?:```\s*skarkix_edit|<skarkix_edit>)\s*\n(.*?)\n\s*(?:```|</skarkix_edit>)",
     re.DOTALL | re.IGNORECASE,
 )
 
-# Atomic multi-file str-replace. Payload contains repeated
-# <<<FILE>>>/<<<OLD>>>/<<<NEW>>> sections terminated by a single <<<END>>>.
-# Pre-validation in ``apply_multi_str_replace`` means either ALL OLD strings
-# match exactly once or NO file is written.
 MULTI_EDIT_ACTION_REGEX = re.compile(
-    r"```\s*apply_multi_edit\s*\n(.*?)\n\s*```",
+    r"(?:```\s*skarkix_multi_edit|<skarkix_multi_edit>)\s*\n(.*?)\n\s*(?:```|</skarkix_multi_edit>)",
     re.DOTALL | re.IGNORECASE,
 )
 
-# Match mini_textbased.yaml observation truncation (10000 / 5000 / 5000).
 MINI_OBSERVATION_FULL_MAX = 10000
 MINI_OBSERVATION_HEAD = 5000
 MINI_OBSERVATION_TAIL = 5000
 
 SYSTEM_PROMPT = """\
-You are a senior software engineer fixing real bugs in real repositories.
+<system>
+You are an expert software developer resolving bugs in production repositories.
 
-Each turn, your response must contain EXACTLY ONE action block. Pick the right
-block type for the work:
+For each turn, you must output EXACTLY ONE action block. Choose the appropriate action block schema:
 
-1. ```rswea_bash_command``` — run a single shell command (or chain with && / ||).
-   ```rswea_bash_command
-   ls -la
+1. ```skarkix_shell``` — execute shell commands (can chain with && / ||).
+   ```skarkix_shell
+   pytest tests/test_file.py
    ```
 
-2. ```apply_str_replace``` — exact text replacement in a file (most reliable
-   for code edits — no shell quoting, no sed escaping). Format:
-   ```apply_str_replace
+2. ```skarkix_edit``` — precise text replacement for code files. This is the preferred method for editing. Format:
+   ```skarkix_edit
    <<<FILE>>>
-   path/to/file.py
+   path/to/target.py
    <<<OLD>>>
    exact text to find (must appear EXACTLY ONCE in the file)
    <<<NEW>>>
-   replacement text
+   replacement code
    <<<END>>>
    ```
-   The OLD block is matched byte-for-byte (preserve whitespace and indentation).
-   If OLD doesn't appear or appears more than once, the action FAILS — narrow
-   it with more surrounding context and retry.
+   The OLD block must match the existing file byte-for-byte, preserving all whitespace and indentation. If it appears multiple times or not at all, the edit will fail.
 
-3. ```apply_multi_edit``` — atomic batch of str-replace edits across one or
-   more files (use when a fix touches several places at once). Same OLD/NEW
-   semantics as ``apply_str_replace``, repeated, then a single ``<<<END>>>``:
-   ```apply_multi_edit
+3. ```skarkix_multi_edit``` — atomic batch of string replacements across multiple files. Format:
+   ```skarkix_multi_edit
    <<<FILE>>>
-   path/to/a.py
+   path/to/file_a.py
    <<<OLD>>>
-   exact text in a.py (must appear EXACTLY ONCE)
+   exact text in a
    <<<NEW>>>
-   replacement
+   new text in a
    <<<FILE>>>
-   path/to/b.py
+   path/to/file_b.py
    <<<OLD>>>
-   exact text in b.py
+   exact text in b
    <<<NEW>>>
-   replacement
+   new text in b
    <<<END>>>
    ```
-   Pre-validation: if ANY OLD is missing or non-unique, NO file is written —
-   the whole batch is rejected with a per-edit error list, so you can fix and
-   resend. Prefer this over multiple single edits whenever a logically
-   coupled change spans 2+ files (e.g. update a function signature in one
-   file and its caller in another).
+   If ANY OLD block is missing or ambiguous, the entire batch fails to prevent partial application.
 
-Always prefix any block with a THOUGHT line explaining your reasoning:
-THOUGHT: <why this action moves you toward a correct fix>
+<rules>
+- Edit existing files rather than creating parallel modules unless specifically required.
+- Always try to reproduce the bug FIRST with a minimal script or test before editing.
+- After fixing the bug, run the project's native tests (e.g., `pytest`, `npm test`, etc.) to confirm your fix.
+- Keep edits minimal and surgical. Preserve public APIs.
+- Handle edge cases implied by the issue (empty inputs, off-by-one errors).
+- Read stderr carefully if a command fails.
+- When you are fully confident the fix works, submit it using the exact command:
+  ```skarkix_shell
+  echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD
+  ```
+</rules>
 
-Engineering rules (apply even if not spelled out in the task):
-- Edit existing files. Do not create parallel modules unless the task requires it.
-- Reproduce the bug FIRST with a minimal command or test, then fix, then re-run.
-- After fixing, run the project's own tests (`pytest -xvs <file>::<test>`,
-  `go test ./...`, `npm test`, `cargo test`, etc.) to confirm.
-- Preserve public APIs and existing conventions; keep edits minimal and surgical.
-- Handle boundary cases the spec implies (empty input, off-by-one, error paths).
-- Never silently swallow stderr — read it.
-- ``apply_str_replace`` is preferred over sed for code edits.
-- **Aliasing / mutation bugs:** If a conversion method (``to_*``, ``as_*``) returns
-  ``self`` and callers mutate the result, fix the **method** to return an independent
-  object (``return self.copy()`` or a new instance)—not only ``.copy()`` at one call site.
-- **Environment:** Shell commands use the task's conda env when available. Do not patch
-  unrelated compatibility shims (e.g. numpy version workarounds) for a different Python.
-
-Every shell command runs in a FRESH shell — directory and environment changes
-do not persist. Prefix with ``cd /path && ...`` when needed.
-
-When you are confident the fix is correct and the tests pass, submit with:
-
-```rswea_bash_command
-echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD
-```
-
-For new untracked files that ``git diff HEAD`` would miss, also list and cat
-them after SUBMIT_PATCH. Do NOT submit until you have verified the fix.
+Always enclose your reasoning in a <thought> block BEFORE outputting your chosen action block.
+</system>
 """
 
-# Appended when RIDGES_STABLE_PROMPT is enabled (behavioral variance reduction).
 STABILITY_SYSTEM_SUFFIX = """\
 
 
 ---
 
-## Repeatability (reduce run-to-run drift)
 
 Unless the problem statement clearly requires a different order:
 
@@ -711,8 +579,6 @@ Unless the problem statement clearly requires a different order:
 2. **Search**: prefer `rg --sort path -n` with sensible `-g` excludes for build/vendor trees so similar hits stay in a stable order.
 3. **Tests**: once a repro or test command works, reuse it after edits instead of switching to a different command each time.
 4. **Ties**: when multiple commands are equally reasonable, pick the shorter; for files, prefer lexicographically smaller paths.
-5. **Pacing**: You operate under a STRICT time limit. Be decisive. Do NOT spend 20+ steps just reading code. Quickly identify the issue, apply your targeted edit, test, and submit. If an edit fails due to exact match errors, verify the exact file content (spacing/indentation) and retry, or use sed.
-6. **Bug Validity**: The bug you are tasked to fix is GUARANTEED to exist in the current codebase. DO NOT assume the bug has already been fixed by a previous commit. If the code looks correct, you are likely looking at the wrong place or misunderstanding the problem statement.
 """
 
 
@@ -722,109 +588,109 @@ def _system_prompt_for_run() -> str:
     return SYSTEM_PROMPT
 
 
-def _instance_prompt_mini(problem_statement: str, working_dir: str) -> str:
-    return f"""Please solve this issue:
+# [SKARKIX CORE] Injects the execution rules and the analyzer's output into the context.
+def _instance_prompt_mini(problem_statement: str, working_dir: str, analysis: dict = None) -> str:
+    analysis_text = ""
+    if analysis:
+        analysis_text = "\n\n<task_analysis>\n"
+        if "summary" in analysis:
+            analysis_text += f"**Summary**: {analysis['summary']}\n"
+        if "hypothesis" in analysis:
+            analysis_text += f"**Hypothesis**: {analysis['hypothesis']}\n"
+        if "files_to_check" in analysis:
+            analysis_text += f"**Files to check**: {', '.join(analysis['files_to_check'])}\n"
+        if "search_terms" in analysis:
+            analysis_text += f"**Search terms**: {', '.join(analysis['search_terms'])}\n"
+        analysis_text += "</task_analysis>"
 
+    return f"""<issue_report>
 {problem_statement}
+</issue_report>{analysis_text}
 
-## Recommended Workflow
+<instructions>
+You are operating in the working directory: {working_dir}
 
-1. **Explore** — understand the layout (`git ls-files`, `ls`, `grep -rn`).
-2. **Reproduce** — write or find a minimal failing test/command BEFORE editing.
-3. **Diagnose** — read the relevant source; identify root cause.
-4. **Edit** — make minimal, targeted edits with ``apply_str_replace``
-   (preferred) or sed/cat where appropriate. Avoid large rewrites.
-5. **Verify** — re-run the reproduction AND tests for **every file you modified**
-   (e.g. if you edit ``core/variable.py``, run ``pytest -xvs .../test_variable.py``),
-   not only integration tests named in the issue.
-6. **Cover edges** — empty inputs, error paths, related code paths the bug
-   implies. Search the codebase for similar patterns to fix consistently.
-   If you added ``.copy()`` at a call site, check whether the callee should return
-   a copy instead (fix ``return self`` in the method).
-7. **Submit** — exactly one action whose command starts with
-   ``echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD``.
+Your objective is to fix the issue described above. Please proceed carefully:
+1. Verify the current state of the codebase.
+2. Attempt to reproduce the issue using the provided reproduction steps or writing a test.
+3. Identify the root cause.
+4. Modify the relevant files using `skarkix_edit` or `skarkix_multi_edit`.
+5. Run the test suite to ensure your fix works and no regressions are introduced.
+6. Submit your changes using `echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD` in a `skarkix_shell` block.
 
-If time runs low: ship a minimal correct patch over polished scaffolding.
-Submitting an incorrect patch is better than submitting nothing.
-
-## Hard rules
-
-- Exactly ONE action block per response.
-- The block must be a fenced ```rswea_bash_command``` or ```apply_str_replace```.
-- Bash actions run in a fresh shell — chain with && or use `cd` prefix.
-- Working directory: {working_dir}
-
-## Example: explore
-
-THOUGHT: I need to map the repo before changing anything.
-
-```rswea_bash_command
-git ls-files | head -60
-```
-
-## Example: read a file region
-
-```rswea_bash_command
-nl -ba src/foo.py | sed -n '120,180p'
-```
-
-## Example: precise edit
-
-THOUGHT: The validator returns True for empty lists; the spec says empty must raise.
-
-```apply_str_replace
-<<<FILE>>>
-src/foo.py
-<<<OLD>>>
-    if not items:
-        return True
-<<<NEW>>>
-    if not items:
-        raise ValueError("items must not be empty")
-<<<END>>>
-```
-
-## Example: run focused tests
-
-```rswea_bash_command
-python -m pytest -xvs tests/test_foo.py::test_empty_raises
-```
-
-## Example: submit
-
-```rswea_bash_command
-echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD
-```
+Remember, you must output exactly ONE action block per turn.
+</instructions>
 """
 
 
 PLANNING_SYSTEM_PROMPT = """\
-You are an expert software planning assistant. Your role is to analyze problems and create a detailed execution plan.
+<system>
+You are an expert software developer resolving bugs in production repositories.
 
-Analyze the problem and create a step-by-step plan to solve it. Your plan should include:
+For each turn, you must output EXACTLY ONE action block. Choose the appropriate action block schema:
 
-1. **Problem Analysis**: Understand what needs to be fixed or implemented
-2. **File Discovery**: Identify which files need to be examined or modified
-3. **Common misunderstandings**: Identify any common misunderstandings that engineers often make when fixing this type of problem.
-4. **Implementation Steps**: Specific actions to take, in order
-5. **Verification Strategy**: How to verify the fix works
+1. ```skarkix_shell``` — execute shell commands (can chain with && / ||).
+   ```skarkix_shell
+   pytest tests/test_file.py
+   ```
 
-Provide your plan in a structured format. Be specific and actionable.
+2. ```skarkix_edit``` — precise text replacement for code files. This is the preferred method for editing. Format:
+   ```skarkix_edit
+   <<<FILE>>>
+   path/to/target.py
+   <<<OLD>>>
+   exact text to find (must appear EXACTLY ONCE in the file)
+   <<<NEW>>>
+   replacement code
+   <<<END>>>
+   ```
+   The OLD block must match the existing file byte-for-byte, preserving all whitespace and indentation. If it appears multiple times or not at all, the edit will fail.
+
+3. ```skarkix_multi_edit``` — atomic batch of string replacements across multiple files. Format:
+   ```skarkix_multi_edit
+   <<<FILE>>>
+   path/to/file_a.py
+   <<<OLD>>>
+   exact text in a
+   <<<NEW>>>
+   new text in a
+   <<<FILE>>>
+   path/to/file_b.py
+   <<<OLD>>>
+   exact text in b
+   <<<NEW>>>
+   new text in b
+   <<<END>>>
+   ```
+   If ANY OLD block is missing or ambiguous, the entire batch fails to prevent partial application.
+
+<rules>
+- Edit existing files rather than creating parallel modules unless specifically required.
+- Always try to reproduce the bug FIRST with a minimal script or test before editing.
+- After fixing the bug, run the project's native tests (e.g., `pytest`, `npm test`, etc.) to confirm your fix.
+- Keep edits minimal and surgical. Preserve public APIs.
+- Handle edge cases implied by the issue (empty inputs, off-by-one errors).
+- Read stderr carefully if a command fails.
+- When you are fully confident the fix works, submit it using the exact command:
+  ```skarkix_shell
+  echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD
+  ```
+</rules>
+
+Always enclose your reasoning in a <thought> block BEFORE outputting your chosen action block.
+</system>
 """
 
 
 def _planning_prompt(problem_statement: str, working_dir: str) -> str:
     return f"""Please analyze this problem and create a detailed execution plan:
 
-## Problem Statement
 
 {problem_statement}
 
-## Working Directory
 
 {working_dir}
 
-## Your Task
 
 Create a comprehensive plan that includes:
 
@@ -840,45 +706,22 @@ Be specific and actionable. Your plan will be used by an execution agent to solv
 
 
 def format_mini_format_error(n_actions: int) -> str:
-    return f"""Format error:
+    return f"""<error>
+Format violation detected. Expected exactly 1 action block, but found {n_actions}.
 
-Expected exactly 1 action block, found {n_actions}.
+You must provide EXACTLY ONE block using one of the allowed schemas:
+- `skarkix_shell`
+- `skarkix_edit`
+- `skarkix_multi_edit`
 
-Please always provide EXACTLY ONE action block in triple backticks.
-Use ```rswea_bash_command``` for shell commands, ```apply_str_replace``` for a
-single file edit, or ```apply_multi_edit``` for an atomic batch across files.
-Example:
-
-THOUGHT: Brief reasoning.
-
-```rswea_bash_command
-<single command>
-```
-
-If you have completed the task, submit with the SUBMIT_PATCH command from the
-first message."""
-
-
-FORMAT_ERROR_MESSAGE = format_mini_format_error(0)
-
+If you have finished, run `echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD` inside a `skarkix_shell` block.
+</error>"""
 
 def _format_error_escalation(strike: int) -> str:
-    """Stronger nudge after repeated format failures."""
-    base = FORMAT_ERROR_MESSAGE
+    base = format_mini_format_error(0)
     if strike <= 1:
         return base
-    header = (
-        f"[Format reminder #{strike}] Your previous response did not contain a single "
-        "fenced action block. You MUST respond with exactly one ```rswea_bash_command``` "
-        "OR one ```apply_str_replace``` block. The THOUGHT line is plain text outside the "
-        "block.\n\n"
-        "If you believe you are done, your single action MUST be:\n\n"
-        "```rswea_bash_command\n"
-        "echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD\n"
-        "```\n\n"
-        "Repeated format failures end this trial without a patch.\n\n"
-    )
-    return header + base
+    return f"[Warning #{strike}] Repeated format failure. {base}"
 
 
 SUBMISSION_SENTINEL = "SUBMIT_PATCH"
@@ -908,7 +751,7 @@ def _resolve_conda_shell_prefix() -> str:
     return f"source {shlex.quote(activate)} && conda activate {env_name} 2>/dev/null; "
 
 
-class ShellExecutor:
+class WorkspaceEnvironment:
     """Execute bash commands in the sandbox and capture output."""
 
     def __init__(
@@ -963,7 +806,7 @@ def normalize_patch_text(patch: str) -> str:
     return out.strip("\n") + ("\n" if out.strip() else "")
 
 
-def authoritative_worktree_patch(executor: "ShellExecutor") -> str:
+def authoritative_worktree_patch(executor: "WorkspaceEnvironment") -> str:
     """Unified diff from repo state (HEAD vs worktree), not captured shell transcript."""
     diff = executor.execute("git -c color.ui=false -c core.pager=cat diff HEAD")
     parts: list[str] = []
@@ -988,11 +831,377 @@ def count_mini_actions(response: str) -> int:
     """
     edits = EDIT_ACTION_REGEX.findall(response)
     multi_edits = MULTI_EDIT_ACTION_REGEX.findall(response)
-    rsweas = MINI_ACTION_REGEX_RSWEA.findall(response)
-    bashes = MINI_ACTION_REGEX_BASH.findall(response)
+    rsweas = ACTION_REGEX_SHELL.findall(response)
+    bashes = ACTION_REGEX_FALLBACK_BASH.findall(response)
     shell_blocks = len(rsweas) + (len(bashes) if not rsweas else 0)
     return len(edits) + len(multi_edits) + shell_blocks
 
+
+# [SKARKIX CORE] Parses the LLM payload to extract execution blocks.
+def skarkix_finalize_patch(patch: str, working_dir: str) -> str:
+    """Repair + apply-check; use disk only when the run returned empty."""
+    if not patch or not patch.strip():
+        disk = _read_disk_fallback_patch()
+        if not disk.strip():
+            return ""
+        patch = disk
+        print("[AGENT] Run patch empty; trying disk fallback from last successful submit")
+
+    norm = normalize_patch_text(patch)
+    repaired = validate_or_repair_patch(norm, working_dir)
+    if repaired:
+        return repaired
+    if validate_patch_applies_cleanly(norm, working_dir):
+        return norm
+    return ""
+
+_BASELINE_COMMIT_HASH: Optional[str] = None
+
+def _baseline_ref() -> str:
+    """Return the pinned baseline commit hash, falling back to ``HEAD``."""
+    return _BASELINE_COMMIT_HASH or "HEAD"
+
+_PATCH_EXCLUDE_PATHSPECS: tuple[str, ...] = (
+    ":(exclude,glob)**/target/**",
+    ":(exclude,glob)**/__pycache__/**",
+    ":(exclude,glob)**/.pytest_cache/**",
+    ":(exclude,glob)**/.mypy_cache/**",
+    ":(exclude,glob)**/.ruff_cache/**",
+    ":(exclude,glob)**/node_modules/**",
+    ":(exclude,glob)**/dist/**",
+    ":(exclude,glob)**/build/**",
+    ":(exclude,glob)**/.tox/**",
+    ":(exclude,glob)**/.venv/**",
+    ":(exclude,glob)**/.git/**",
+    ":(exclude,glob)**/*.pyc",
+    ":(exclude,glob)**/*.so",
+    ":(exclude,glob)**/*.o",
+    ":(exclude,glob)**/*.a",
+    ":(exclude,glob)**/*.rlib",
+    ":(exclude,glob)**/*.rmeta",
+    ":(exclude,glob)**/*.dylib",
+    ":(exclude,glob)**/*.dll",
+    ":(exclude,glob)**/*.exe",
+    ":(exclude,glob)**/Cargo.lock",
+)
+
+_PATCH_EXCLUDE_DIR_SEGMENTS: tuple[str, ...] = (
+    "target",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "node_modules",
+    "dist",
+    "build",
+    ".tox",
+    ".venv",
+    ".git",
+)
+
+_PATCH_EXCLUDE_EXTENSIONS: tuple[str, ...] = (
+    ".pyc", ".so", ".o", ".a", ".rlib", ".rmeta", ".dylib", ".dll", ".exe",
+)
+
+def _patch_exclude_args() -> list[str]:
+    """Return the pathspec list as positional args for ``git`` subprocess calls."""
+    return list(_PATCH_EXCLUDE_PATHSPECS)
+
+def _patch_exclude_shell() -> str:
+    """Return the same pathspecs joined and shell-quoted for ``executor.execute``."""
+    return " ".join(shlex.quote(p) for p in _PATCH_EXCLUDE_PATHSPECS)
+
+def _path_matches_excludes(path: str) -> bool:
+    """Pure-Python check used by the in-process patch repair."""
+    if not path:
+        return False
+    norm = path.replace("\\", "/").lstrip("./")
+    parts = norm.split("/")
+    if any(seg in _PATCH_EXCLUDE_DIR_SEGMENTS for seg in parts):
+        return True
+    lower = norm.lower()
+    return any(lower.endswith(ext) for ext in _PATCH_EXCLUDE_EXTENSIONS)
+
+_BEST_PATCH_DISK_PATH = os.environ.get(
+    "RIDGES_BEST_PATCH_PATH",
+    os.path.join(tempfile.gettempdir(), "agent_best_patch.diff"),
+)
+
+def _atomic_write_text(path: str, text: str) -> bool:
+    try:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".best_patch_", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp_path, path)
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        print(f"[AGENT] _atomic_write_text({path}) failed: {e}")
+        return False
+
+def _read_disk_fallback_patch() -> str:
+    try:
+        if os.path.isfile(_BEST_PATCH_DISK_PATH):
+            with open(_BEST_PATCH_DISK_PATH, "r", encoding="utf-8") as f:
+                return f.read() or ""
+    except Exception as e:
+        print(f"[AGENT] _read_disk_fallback_patch failed: {e}")
+    return ""
+
+def _clear_disk_fallback() -> None:
+    try:
+        if os.path.isfile(_BEST_PATCH_DISK_PATH):
+            os.unlink(_BEST_PATCH_DISK_PATH)
+    except OSError:
+        pass
+
+def _working_dir_is_git_repo(working_dir: str) -> bool:
+    """Repo detection that handles both ``.git`` dirs and gitfiles (linked worktrees)."""
+    if not working_dir or not os.path.isdir(working_dir):
+        return False
+    git_marker = os.path.join(working_dir, ".git")
+    return os.path.isdir(git_marker) or os.path.isfile(git_marker)
+
+_DIFF_SECTION_HEAD = re.compile(r"^diff --git ", re.MULTILINE)
+
+def _split_patch_by_file(patch: str) -> list[str]:
+    """Split a unified diff into per-file sections (one ``diff --git`` each)."""
+    if not patch:
+        return []
+    indices: list[int] = []
+    for m in _DIFF_SECTION_HEAD.finditer(patch):
+        indices.append(m.start())
+    if not indices:
+        return [patch]
+    indices.append(len(patch))
+    sections: list[str] = []
+    for i in range(len(indices) - 1):
+        sec = patch[indices[i] : indices[i + 1]]
+        if sec.strip():
+            sections.append(sec)
+    return sections
+
+def _diff_section_target_path(section: str) -> Optional[str]:
+    """Return the post-image path (``b/...``) for a single diff section."""
+    for line in section.splitlines()[:6]:
+        if line.startswith("+++ "):
+            rest = line[4:].strip()
+            if rest == "/dev/null":
+                continue
+            if rest.startswith("b/"):
+                return rest[2:]
+            return rest
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                return parts[3][2:]
+    return None
+
+def _section_creates_file(section: str) -> bool:
+    return "new file mode" in section or "--- /dev/null" in section
+
+def _section_deletes_file(section: str) -> bool:
+    return "deleted file mode" in section or "+++ /dev/null" in section
+
+def _filter_patch_sections(patch: str, working_dir: str) -> str:
+    """Drop sections whose target path is excluded or missing in baseline.
+
+    For modify/delete sections we additionally require the file to exist in
+    the baseline tree (otherwise ``git apply --check`` is guaranteed to fail
+    with ``does not exist in index``).
+    """
+    sections = _split_patch_by_file(patch)
+    if len(sections) <= 1 and not _DIFF_SECTION_HEAD.search(patch or ""):
+        return patch
+    if not working_dir:
+        return patch
+
+    kept: list[str] = []
+    dropped = 0
+    for sec in sections:
+        target = _diff_section_target_path(sec)
+        if target is None:
+            kept.append(sec)
+            continue
+        if _path_matches_excludes(target):
+            dropped += 1
+            continue
+        if not _section_creates_file(sec):
+            try:
+                r = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        working_dir,
+                        "cat-file",
+                        "-e",
+                        f"{_baseline_ref()}:{target}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if r.returncode != 0:
+                    dropped += 1
+                    continue
+            except Exception:
+                pass
+        kept.append(sec)
+
+    if dropped:
+        print(f"[AGENT] _filter_patch_sections dropped {dropped} section(s)")
+    if not kept:
+        return ""
+    return "".join(kept)
+
+_APPLY_TOLERANT_FLAG_SETS: tuple[tuple[str, ...], ...] = (
+    ("--ignore-whitespace",),
+    ("--ignore-whitespace", "--whitespace=fix"),
+    ("--ignore-whitespace", "--whitespace=fix", "--recount"),
+)
+
+def _apply_and_redump(patch: str, working_dir: str) -> Optional[str]:
+    """Apply ``patch`` with progressively lenient flags, then re-dump as a
+    strictly applicable diff via ``git diff`` against the baseline.
+
+    Returns the new patch text on success, or ``None`` if every strategy fails.
+    The worktree is reset to the baseline before each attempt so retries don't
+    accumulate partial state. The most lenient strategies still require
+    matching context — we deliberately do *not* use ``-C0`` because that
+    silently drops hunks at wrong offsets.
+    """
+    if not working_dir or not os.path.isdir(working_dir):
+        return None
+    if not _working_dir_is_git_repo(working_dir):
+        return None
+
+    base = _baseline_ref()
+    for flags in _APPLY_TOLERANT_FLAG_SETS:
+        try:
+            subprocess.run(
+                ["git", "-C", working_dir, "reset", "--hard", base],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            subprocess.run(
+                ["git", "-C", working_dir, "clean", "-fdx", "--", *_patch_exclude_args()],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            apply = subprocess.run(
+                ["git", "-C", working_dir, "apply", *flags],
+                input=patch,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if apply.returncode != 0:
+                continue
+            staged = subprocess.run(
+                ["git", "-C", working_dir, "add", "-A", "--", *_patch_exclude_args()],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if staged.returncode != 0:
+                continue
+            diff = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    working_dir,
+                    "-c",
+                    "color.ui=false",
+                    "-c",
+                    "core.pager=cat",
+                    "diff",
+                    "--cached",
+                    base,
+                    "--",
+                    *_patch_exclude_args(),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if diff.returncode == 0 and (diff.stdout or "").strip():
+                redumped = normalize_patch_text(diff.stdout)
+                if redumped:
+                    print(
+                        f"[AGENT] _apply_and_redump succeeded with flags={list(flags)} "
+                        f"({len(redumped)} chars)"
+                    )
+                    return redumped
+        except Exception as e:
+            print(f"[AGENT] _apply_and_redump error (flags={list(flags)}): {e}")
+            continue
+        finally:
+            try:
+                subprocess.run(
+                    ["git", "-C", working_dir, "reset", "--hard", base],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except Exception:
+                pass
+    return None
+
+def validate_or_repair_patch(patch: str, working_dir: str) -> str:
+    """Return a patch that passes ``git apply --check``, or ``""`` if none can
+    be derived. Strategy:
+
+      1. Drop sections targeting excluded paths (build artifacts) and missing
+         files. The filter is idempotent for clean inputs and is always run so
+         we don't ship binary blobs even when the strict apply happens to
+         succeed locally.
+      2. Try strict apply on the filtered patch.
+      3. Fall back to ``apply-and-redump`` for whitespace / line-ending drift.
+    """
+    if not patch or not patch.strip():
+        return ""
+    if not working_dir or not os.path.isdir(working_dir):
+        return ""
+
+    norm = normalize_patch_text(patch)
+
+    filtered_raw = _filter_patch_sections(norm, working_dir)
+    if filtered_raw:
+        filtered = normalize_patch_text(filtered_raw)
+        if filtered != norm:
+            print(
+                f"[AGENT] validate_or_repair_patch: path filter "
+                f"{len(norm)} -> {len(filtered)} chars"
+            )
+        if validate_patch_applies_cleanly(filtered, working_dir):
+            return filtered
+    else:
+        # Filter dropped everything — nothing useful to ship.
+        filtered = ""
+
+    if filtered and filtered != norm:
+        # The unfiltered version may still apply (e.g. the dropped section was
+        # itself acceptable upstream). Try it as a secondary strategy.
+        if validate_patch_applies_cleanly(norm, working_dir):
+            return norm
+
+    redump_input = filtered or norm
+    redumped = _apply_and_redump(redump_input, working_dir)
+    if redumped and validate_patch_applies_cleanly(redumped, working_dir):
+        print(f"[AGENT] validate_or_repair_patch: redumped patch passed ({len(redumped)} chars)")
+        return redumped
+
+    return ""
 
 def parse_action(response: str) -> Tuple[Optional[str], Optional[str]]:
     """Extract exactly one action.
@@ -1003,8 +1212,8 @@ def parse_action(response: str) -> Tuple[Optional[str], Optional[str]]:
     """
     edits = [a.strip() for a in EDIT_ACTION_REGEX.findall(response)]
     multi_edits = [a.strip() for a in MULTI_EDIT_ACTION_REGEX.findall(response)]
-    rsweas = [a.strip() for a in MINI_ACTION_REGEX_RSWEA.findall(response)]
-    bashes = [a.strip() for a in MINI_ACTION_REGEX_BASH.findall(response)]
+    rsweas = [a.strip() for a in ACTION_REGEX_SHELL.findall(response)]
+    bashes = [a.strip() for a in ACTION_REGEX_FALLBACK_BASH.findall(response)]
 
     total = (
         len(edits)
@@ -1050,12 +1259,11 @@ _EDIT_SECTION_RE = re.compile(
 )
 
 def parse_edit_payload(payload: str) -> Optional[Tuple[str, str, str]]:
-    """Parse the ``apply_str_replace`` body into (file, old_str, new_str).
+    """Parse the ``skarkix_edit`` body into (file, old_str, new_str).
 
     Returns None when the markers are missing or malformed.
     """
     payload = payload.replace("\r\n", "\n").replace("\r", "\n")
-    # Allow any leading text before <<<FILE>>> for resilience.
     m = _EDIT_SECTION_RE.search(payload)
     if not m:
         return None
@@ -1067,38 +1275,44 @@ def parse_edit_payload(payload: str) -> Optional[Tuple[str, str, str]]:
     return file_path, old_str, new_str
 
 
-def _prepare_str_replace_edit(
-    working_dir: str, file_path: str, old_str: str, new_str: str, label: str = ""
-) -> tuple[str | None, str | None, str | None, str | None]:
+def skarkix_edit(working_dir: str, file_path: str, old_str: str, new_str: str) -> dict[str, Any]:
+    """Apply a single exact-match str-replace edit.
+
+    Returns a WorkspaceEnvironment-style dict so observations format consistently.
     """
-    Validates and prepares a single str-replace edit.
-    Returns: (full_path, new_content, error_msg, summary_stats)
-    Exactly one of new_content or error_msg will be populated.
-    """
-    prefix = f"{label} " if label else ""
     full = file_path if os.path.isabs(file_path) else os.path.join(working_dir, file_path)
-
     if not os.path.isfile(full):
-        return None, None, f"{prefix}file not found: {file_path}", None
+        return {
+            "stdout": "",
+            "stderr": f"skarkix_edit: file not found: {file_path}",
+            "returncode": 2,
+            "timed_out": False,
+        }
     if old_str == new_str:
-        return None, None, f"{prefix}OLD and NEW are identical; nothing to do.", None
-
+        return {
+            "stdout": "",
+            "stderr": "skarkix_edit: OLD and NEW are identical; nothing to do.",
+            "returncode": 2,
+            "timed_out": False,
+        }
     try:
         with open(full, "r", encoding="utf-8", errors="surrogateescape") as f:
             content = f.read()
     except Exception as e:
-        return None, None, f"{prefix}read error: {type(e).__name__}: {e}", None
-
+        return {
+            "stdout": "",
+            "stderr": f"skarkix_edit: read error: {type(e).__name__}: {e}",
+            "returncode": 2,
+            "timed_out": False,
+        }
     count = content.count(old_str)
     if count == 0:
-        # Fallback to normalized line endings
         norm_old = old_str.replace("\r\n", "\n").replace("\r", "\n")
         norm_content = content.replace("\r\n", "\n").replace("\r", "\n")
         if norm_content.count(norm_old) == 1:
             old_str = norm_old
             content = norm_content
             count = 1
-
     if count == 0:
         hint_lines = []
         if old_str.strip():
@@ -1110,43 +1324,48 @@ def _prepare_str_replace_edit(
                         if len(hint_lines) >= 5:
                             break
         hint = ("\nNearest matches on first OLD line:\n" + "\n".join(hint_lines)) if hint_lines else ""
-        err = f"{prefix}OLD not found in {file_path}. Provide the EXACT bytes to replace (whitespace and indentation matter).{hint}"
-        return None, None, err, None
-
+        return {
+            "stdout": "",
+            "stderr": (
+                f"skarkix_edit: OLD not found in {file_path}. Provide the EXACT bytes "
+                f"to replace (whitespace and indentation matter).{hint}"
+            ),
+            "returncode": 2,
+            "timed_out": False,
+        }
     if count > 1:
-        return None, None, f"{prefix}OLD matches {count} places in {file_path}; add more surrounding context so it appears exactly once.", None
-
+        return {
+            "stdout": "",
+            "stderr": (
+                f"skarkix_edit: OLD matches {count} places in {file_path}; add more "
+                "surrounding context so it appears exactly once."
+            ),
+            "returncode": 2,
+            "timed_out": False,
+        }
     new_content = content.replace(old_str, new_str, 1)
-    delta = len(new_str) - len(old_str)
-    summary = f"old={len(old_str)} bytes, new={len(new_str)} bytes, delta={delta:+d}"
-    return full, new_content, None, summary
-
-
-def apply_str_replace(working_dir: str, file_path: str, old_str: str, new_str: str) -> dict[str, Any]:
-    """Apply a single exact-match str-replace edit."""
-    full_path, new_content, err_msg, summary = _prepare_str_replace_edit(
-        working_dir, file_path, old_str, new_str, label="apply_str_replace:"
-    )
-    if err_msg:
-        return {"stdout": "", "stderr": err_msg, "returncode": 2, "timed_out": False}
-
     try:
-        with open(full_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        with open(full, "w", encoding="utf-8", errors="surrogateescape") as f:
             f.write(new_content)
     except Exception as e:
-        return {"stdout": "", "stderr": f"apply_str_replace: write error: {type(e).__name__}: {e}", "returncode": 2, "timed_out": False}
-
+        return {
+            "stdout": "",
+            "stderr": f"skarkix_edit: write error: {type(e).__name__}: {e}",
+            "returncode": 2,
+            "timed_out": False,
+        }
+    delta = len(new_str) - len(old_str)
     return {
-        "stdout": f"apply_str_replace: OK — {file_path} updated ({summary}).\n",
+        "stdout": (
+            f"skarkix_edit: OK — {file_path} updated "
+            f"(old={len(old_str)} bytes, new={len(new_str)} bytes, delta={delta:+d}).\n"
+        ),
         "stderr": "",
         "returncode": 0,
         "timed_out": False,
     }
 
 
-# ---------------------------------------------------------------------------
-# apply_multi_edit — atomic batch of str-replace edits across multiple files
-# ---------------------------------------------------------------------------
 
 _MULTI_EDIT_BLOCK_RE = re.compile(
     r"<<<FILE>>>\n(?P<file>[^\n]+)\n<<<OLD>>>\n(?P<old>.*?)\n<<<NEW>>>\n(?P<new>.*?)(?=\n<<<FILE>>>\n|\n<<<END>>>)",
@@ -1155,7 +1374,12 @@ _MULTI_EDIT_BLOCK_RE = re.compile(
 
 
 def parse_multi_edit_payload(payload: str) -> Optional[list[Tuple[str, str, str]]]:
-    """Parse the ``apply_multi_edit`` body into a list of (file, old, new)."""
+    """Parse the ``skarkix_multi_edit`` body into a list of (file, old, new).
+
+    Returns None when the markers are missing or malformed. The payload must
+    contain at least one ``<<<FILE>>>/<<<OLD>>>/<<<NEW>>>`` triple terminated
+    by a single ``<<<END>>>`` sentinel.
+    """
     payload = payload.replace("\r\n", "\n").replace("\r", "\n")
     if "<<<END>>>" not in payload:
         return None
@@ -1171,59 +1395,111 @@ def parse_multi_edit_payload(payload: str) -> Optional[list[Tuple[str, str, str]
     return edits or None
 
 
-def apply_multi_str_replace(working_dir: str, edits: list[Tuple[str, str, str]]) -> dict[str, Any]:
-    """Apply a batch of str-replace edits atomically (pre-validate, then write)."""
+def skarkix_multi_edit(
+    working_dir: str,
+    edits: list[Tuple[str, str, str]],
+) -> dict[str, Any]:
+    """Apply a batch of str-replace edits atomically (pre-validate, then write).
+
+    Phase 1: for every (file, old, new), check file exists and OLD matches
+    exactly once. Compute the new content but DO NOT write.
+    Phase 2: only if every edit passed phase 1, write all files.
+
+    If any phase-1 check fails, NO file is modified and the full error list
+    is returned. If a phase-2 write fails (rare — disk error), prior writes
+    are not rolled back; the error names which file failed.
+    """
     if not edits:
-        return {"stdout": "", "stderr": "apply_multi_edit: payload contained no edits.", "returncode": 2, "timed_out": False}
-
-    plans = []
-    errors = []
-    for idx, (file_path, old_str, new_str) in enumerate(edits, 1):
-        full_path, new_content, err_msg, summary = _prepare_str_replace_edit(
-            working_dir, file_path, old_str, new_str, label=f"#{idx}"
-        )
-        if err_msg:
-            errors.append(err_msg)
-        else:
-            plans.append((file_path, full_path, new_content, summary))
-
-    if errors:
         return {
             "stdout": "",
-            "stderr": "apply_multi_edit: pre-validation FAILED, no files written:\n  " + "\n  ".join(errors) + "\nFix every error above and resend the entire batch.",
+            "stderr": "skarkix_multi_edit: payload contained no edits.",
             "returncode": 2,
             "timed_out": False,
         }
 
-    written = []
-    for file_path, full_path, new_content, summary in plans:
+    plans: list[Tuple[str, str, str, str]] = []  # (file_path, full_path, new_content, summary)
+    errors: list[str] = []
+
+    for idx, (file_path, old_str, new_str) in enumerate(edits, 1):
+        full = file_path if os.path.isabs(file_path) else os.path.join(working_dir, file_path)
+        if not os.path.isfile(full):
+            errors.append(f"#{idx} {file_path}: file not found")
+            continue
+        if old_str == new_str:
+            errors.append(f"#{idx} {file_path}: OLD and NEW identical (nothing to do)")
+            continue
         try:
-            with open(full_path, "w", encoding="utf-8", errors="surrogateescape") as f:
+            with open(full, "r", encoding="utf-8", errors="surrogateescape") as f:
+                content = f.read()
+        except Exception as e:
+            errors.append(f"#{idx} {file_path}: read error: {type(e).__name__}: {e}")
+            continue
+        count = content.count(old_str)
+        if count == 0:
+            norm_old = old_str.replace("\r\n", "\n").replace("\r", "\n")
+            norm_content = content.replace("\r\n", "\n").replace("\r", "\n")
+            if norm_content.count(norm_old) == 1:
+                old_str = norm_old
+                content = norm_content
+                count = 1
+        if count == 0:
+            errors.append(
+                f"#{idx} {file_path}: OLD not found (whitespace must match byte-for-byte)"
+            )
+            continue
+        if count > 1:
+            errors.append(
+                f"#{idx} {file_path}: OLD matches {count} places; add more surrounding context"
+            )
+            continue
+        new_content = content.replace(old_str, new_str, 1)
+        delta = len(new_str) - len(old_str)
+        summary = f"old={len(old_str)}b, new={len(new_str)}b, delta={delta:+d}"
+        plans.append((file_path, full, new_content, summary))
+
+    if errors:
+        joined = "\n  ".join(errors)
+        return {
+            "stdout": "",
+            "stderr": (
+                "skarkix_multi_edit: pre-validation FAILED, no files written:\n  "
+                + joined
+                + "\nFix every error above and resend the entire batch."
+            ),
+            "returncode": 2,
+            "timed_out": False,
+        }
+
+    written: list[str] = []
+    for file_path, full, new_content, summary in plans:
+        try:
+            with open(full, "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.write(new_content)
             written.append(f"  {file_path} ({summary})")
         except Exception as e:
             partial = "\n".join(written) if written else "  (none)"
             return {
-                "stdout": f"apply_multi_edit: PARTIAL — wrote {len(written)}/{len(plans)} edits:\n{partial}\n",
-                "stderr": f"apply_multi_edit: write error on {file_path}: {type(e).__name__}: {e}",
+                "stdout": f"skarkix_multi_edit: PARTIAL — wrote {len(written)}/{len(plans)} edits:\n{partial}\n",
+                "stderr": f"skarkix_multi_edit: write error on {file_path}: {type(e).__name__}: {e}",
                 "returncode": 2,
                 "timed_out": False,
             }
 
     return {
-        "stdout": f"apply_multi_edit: OK — {len(plans)} edits applied:\n" + "\n".join(written) + "\n",
+        "stdout": (
+            f"skarkix_multi_edit: OK — {len(plans)} edits applied:\n"
+            + "\n".join(written)
+            + "\n"
+        ),
         "stderr": "",
         "returncode": 0,
         "timed_out": False,
     }
 
 
-# ---------------------------------------------------------------------------
-# Conversation Manager — manages message history with context window control
-# ---------------------------------------------------------------------------
 
 
-class ConversationManager:
+class ContextWindowTracker:
     """Manage LLM conversation history with truncation and context window control."""
 
     def __init__(self, max_chars: int = 120000):
@@ -1295,7 +1571,7 @@ def shell_output_to_mini_dict(output: dict[str, Any]) -> dict[str, Any]:
         "exception_info": exc,
     }
 
-def format_mini_observation(output: dict[str, Any], time_remaining: int | None = None) -> str:
+def format_mini_observation(output: dict[str, Any]) -> str:
     """Observation text aligned with mini_textbased.yaml ``observation_template``."""
     mini = shell_output_to_mini_dict(output)
     lines: list[str] = []
@@ -1324,9 +1600,6 @@ def format_mini_observation(output: dict[str, Any], time_remaining: int | None =
         lines.append(f"{elided} characters elided")
         lines.append("")
         lines.append(body[-MINI_OBSERVATION_TAIL:])
-    if time_remaining is not None:
-        lines.append("")
-        lines.append(f"[SYSTEM: Time Remaining ~{time_remaining}s]")
     return "\n".join(lines).rstrip() + "\n"
 
 def validate_patch(patch: str) -> bool:
@@ -1338,12 +1611,19 @@ def validate_patch(patch: str) -> bool:
             return False
     return True
 
-def _working_dir_is_git_repo(working_dir: str) -> bool:
-    """Repo detection that handles both ``.git`` dirs and gitfiles (linked worktrees)."""
-    if not working_dir or not os.path.isdir(working_dir):
+def validate_patch_with_git(patch: str, working_dir: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "apply", "--check"],
+            input=patch,
+            capture_output=True,
+            text=True,
+            cwd=working_dir,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
         return False
-    git_marker = os.path.join(working_dir, ".git")
-    return os.path.isdir(git_marker) or os.path.isfile(git_marker)
 
 
 def validate_patch_applies_cleanly(patch: str, working_dir: str) -> bool:
@@ -1352,15 +1632,8 @@ def validate_patch_applies_cleanly(patch: str, working_dir: str) -> bool:
         return False
     if not validate_patch(patch):
         return False
-    
-    # If not a git repo, stash logic fails. Fallback to direct apply check.
     if not _working_dir_is_git_repo(working_dir):
-        try:
-            return subprocess.run(
-                ["git", "apply", "--check"], input=patch, capture_output=True, text=True, cwd=working_dir, timeout=10
-            ).returncode == 0
-        except Exception:
-            return False
+        return validate_patch_with_git(patch, working_dir)
 
     stashed = False
     apply_ok = False
@@ -1492,7 +1765,6 @@ def _extract_patch_paths(patch: str) -> list[str]:
     return seen
 
 
-# --- Submission diff linting -------------------------------------------------
 
 
 def _statement_has_side_effect_language(problem_statement: str) -> bool:
@@ -1510,12 +1782,10 @@ def _diff_uses_callsite_clone_workaround(patch: str) -> bool:
     if not re.search(r"to_\w+\(\)", patch):
         return False
     defined = set(_patch_defines_to_method(patch))
-    # Method body fix: return self -> return self.copy() counts as fixing the callee
     if re.search(r"\+[^\n]*return\s+self\.copy\(\)", patch):
         for method in defined:
             if method in patch:
                 return False
-    # Scan hunks: to_*() on context or + lines near a +.copy() without def change
     hunks = re.split(r"(?=^@@ )", patch, flags=re.MULTILINE)
     for hunk in hunks:
         if not re.search(r"\+.*\.copy\(\)", hunk):
@@ -1559,7 +1829,6 @@ def _diff_exceeds_declared_scope(patch: str, problem_statement: str) -> tuple[bo
         elif is_compat_shim and not overlap:
             suspect.append(p)
         elif not overlap and not is_compat_shim:
-            # Unmentioned non-shim file alongside other edits
             if any(
                 x in path_lower
                 for x in ("requirements", "pyproject.toml", "setup.cfg")
@@ -1620,7 +1889,6 @@ def _infer_test_path(modified_py_path: str, working_dir: str) -> str | None:
         if not working_dir or os.path.isfile(os.path.join(working_dir, candidate)):
             return candidate
 
-    # src/foo/bar.py -> tests/test_bar.py or test/test_bar.py
     for tests_dir in ("tests", "test"):
         parent = os.path.dirname(path)
         while parent and parent != ".":
@@ -1637,7 +1905,6 @@ def _infer_test_path(modified_py_path: str, working_dir: str) -> str | None:
     return None
 
 
-# --- Change facet derivation & inline regression fixtures --------------------
 
 
 def _inline_fixtures_applicable(patch: str, problem_statement: str) -> bool:
@@ -1656,7 +1923,6 @@ def _inline_fixtures_applicable(patch: str, problem_statement: str) -> bool:
 
 _INLINE_FIXTURE_PASS = "inline_fixture_pass"
 
-# Change-impact facets (library-agnostic keys)
 _FACET_TYPED_ADAPTER = "typed_adapter"
 _FACET_AXIS_REBIND = "axis_rebind"
 
@@ -1762,7 +2028,7 @@ def _enumerate_inline_regression_fixtures(
 
 
 def _execute_submission_fixtures(
-    executor: ShellExecutor,
+    executor: WorkspaceEnvironment,
     patch: str,
     problem_statement: str,
     working_dir: str,
@@ -1799,7 +2065,7 @@ def _submit_verify_enabled(problem_statement: str) -> bool:
 
 
 def _run_module_pytest_on_submit(
-    executor: ShellExecutor,
+    executor: WorkspaceEnvironment,
     patch: str,
     working_dir: str,
     problem_statement: str,
@@ -1859,9 +2125,6 @@ def _self_verify_patch(patch: str, working_dir: str) -> tuple[bool, str]:
     return False, (r.stderr or r.stdout or "py_compile failed").strip()
 
 
-# ---------------------------------------------------------------------------
-# The Coding Agent
-# ---------------------------------------------------------------------------
 
 
 _LOOP_DETECT_WINDOW = 8
@@ -1873,11 +2136,52 @@ _MODIFYING_COMMAND_TOKENS = (
 )
 
 
-class CodingAgent:
+# [SKARKIX CORE] The primary autonomous loop for navigating and patching.\n
+ANALYZER_PROMPT = """\
+<system>
+You are the advanced Antigravity Code Analyzer. Your role is to break down complex bugs into actionable search coordinates and root-cause hypotheses before any code is written.
+
+Please output your analysis as a JSON object:
+{
+    "summary": "Brief summary of the issue",
+    "search_terms": ["list", "of", "grep", "queries"],
+    "files_to_check": ["path/to/file1.py"],
+    "hypothesis": "Root cause theory",
+    "verification_strategy": "How to verify the fix"
+}
+</system>
+"""
+
+import json as json_lib
+
+class TaskAnalyzer:
+    # [SKARKIX CORE] Chain-of-thought analysis node.
+    def __init__(self, model: str):
+        self._model = model
+
+    def analyze(self, problem_statement: str) -> dict:
+        messages = [
+            {"role": "system", "content": ANALYZER_PROMPT},
+            {"role": "user", "content": problem_statement}
+        ]
+        
+        for _ in range(3):
+            try:
+                response, _ = inference(self._model, 0.0, messages)
+                if response:
+                    start = response.find("{")
+                    end = response.rfind("}")
+                    if start >= 0 and end > start:
+                        return json_lib.loads(response[start:end+1])
+            except Exception:
+                pass
+        return {}
+
+class SkarkixAgent:
     """LLM + bash loop modeled on ridges-agent (text-based actions, linear messages).
 
-    Each turn: query the model, parse exactly one action (rswea_bash_command or
-    apply_str_replace), execute, append the mini-style observation. Exit when a
+    Each turn: query the model, parse exactly one action (skarkix_shell or
+    skarkix_edit), execute, append the mini-style observation. Exit when a
     valid SUBMIT_PATCH diff is produced, step budget is exhausted, or time runs out.
     """
 
@@ -1886,12 +2190,13 @@ class CodingAgent:
         _conda_prefix = _resolve_conda_shell_prefix()
         if _conda_prefix:
             print("[AGENT] Shell commands will use conda env prefix (RIDGES_AGENT_CONDA_ENV)")
-        self.executor = ShellExecutor(
+        self.executor = WorkspaceEnvironment(
             working_dir=self.config.working_dir,
             timeout=self.config.command_timeout,
             shell_prefix=_conda_prefix,
         )
-        self.conversation = ConversationManager(max_chars=self.config.max_conversation_chars)
+        self.analyzer = TaskAnalyzer(model=self.config.planning_model)
+        self.conversation = ContextWindowTracker(max_chars=self.config.max_conversation_chars)
         self.step_count = 0
         self.start_time: float = 0
         self.files_modified: set[str] = set()
@@ -1900,7 +2205,6 @@ class CodingAgent:
         self._edit_nudge_sent: set[str] = set()
         self.problem_statement: str = ""
 
-        # Cost tracking
         self.total_cost: float = 0.0
         self.total_prompt_tokens: int = 0
         self.total_completion_tokens: int = 0
@@ -1910,16 +2214,11 @@ class CodingAgent:
         self._model_pricing = self._execution_model_pricing
         self.cost_limit = self.config.cost_limit
 
-        # Planning
         self.plan: str = ""
         self.planning_completed: bool = False
 
-        # Best-effort LLM determinism (see ``inference`` seed / top_p).
         self._llm_seed: int | None = _resolve_llm_seed() if _llm_seed_enabled() else None
 
-    # Cached prompt tokens are charged at roughly 10–25% of the full input
-    # rate across providers (Anthropic 10%, OpenAI/DeepSeek ~50%, MiniMax ~25%).
-    # Use 0.25 as a conservative blended discount so reported cost ≥ real cost.
     _CACHE_READ_DISCOUNT = 0.25
 
     def _calculate_cost(
@@ -1957,7 +2256,6 @@ class CodingAgent:
             return False
         return self.total_cost >= self.cost_limit * 0.9
 
-    # --- Working dir helpers ------------------------------------------------
 
     def _detect_working_dir(self) -> str:
         """Walk upward from cwd until a git root (.git dir or gitfile) is found."""
@@ -1972,12 +2270,15 @@ class CodingAgent:
             path = parent
         return cwd
 
-    # --- Conversation -------------------------------------------------------
 
     def _build_initial_messages(self, problem_statement: str) -> None:
         working_dir = self.config.working_dir or self._detect_working_dir()
         self.conversation.add("system", _system_prompt_for_run())
-        self.conversation.add("user", _instance_prompt_mini(problem_statement, working_dir))
+        print("[AGENT] Analyzing task...")
+        analysis = self.analyzer.analyze(problem_statement)
+        print(f"[AGENT] Analysis complete: {analysis}")
+        
+        self.conversation.add("user", _instance_prompt_mini(problem_statement, self.config.working_dir, analysis))
 
     def _should_run_planning(self) -> bool:
         if not self.config.enable_planning:
@@ -2067,7 +2368,6 @@ class CodingAgent:
         cutoff = max(0.0, wall - margin)
         return elapsed > cutoff
 
-    # --- Loop detection -----------------------------------------------------
 
     def _record_action(self, signature: str) -> None:
         self._recent_actions.append(signature)
@@ -2082,7 +2382,6 @@ class CodingAgent:
         last = self._recent_actions[-_LOOP_DETECT_REPEAT_THRESHOLD:]
         return all(c == last[0] for c in last)
 
-    # --- Emergency patch ---------------------------------------------------
 
     def _emergency_diagnostics(self) -> None:
         wd = self.config.working_dir or self._detect_working_dir()
@@ -2149,7 +2448,6 @@ class CodingAgent:
         print("[AGENT] Emergency patch: all strategies returned empty")
         return ""
 
-    # --- Action dispatch ----------------------------------------------------
 
     def _execute_bash(self, command: str) -> dict[str, Any]:
         print(f"[AGENT] Executing bash: {command[:200]}{'...' if len(command) > 200 else ''}")
@@ -2161,7 +2459,7 @@ class CodingAgent:
             return {
                 "stdout": "",
                 "stderr": (
-                    "apply_str_replace: malformed body. Required markers (in this order):\n"
+                    "skarkix_edit: malformed body. Required markers (in this order):\n"
                     "<<<FILE>>>\n<path>\n<<<OLD>>>\n<exact text>\n<<<NEW>>>\n<replacement>\n<<<END>>>"
                 ),
                 "returncode": 2,
@@ -2173,7 +2471,7 @@ class CodingAgent:
             f"old={len(old_str)}b new={len(new_str)}b"
         )
         wd = self.config.working_dir or self._detect_working_dir()
-        out = apply_str_replace(wd, file_path, old_str, new_str)
+        out = skarkix_edit(wd, file_path, old_str, new_str)
         if out.get("returncode") == 0:
             self.files_modified.add(file_path)
             self._maybe_nudge_after_edit(file_path)
@@ -2185,7 +2483,7 @@ class CodingAgent:
             return {
                 "stdout": "",
                 "stderr": (
-                    "apply_multi_edit: malformed body. Required (one or more "
+                    "skarkix_multi_edit: malformed body. Required (one or more "
                     "blocks, then a single <<<END>>>):\n"
                     "<<<FILE>>>\n<path1>\n<<<OLD>>>\n<exact text>\n<<<NEW>>>\n<replacement>\n"
                     "<<<FILE>>>\n<path2>\n<<<OLD>>>\n<exact text>\n<<<NEW>>>\n<replacement>\n"
@@ -2199,7 +2497,7 @@ class CodingAgent:
             f"{len({p[0] for p in parsed})} file(s)"
         )
         wd = self.config.working_dir or self._detect_working_dir()
-        out = apply_multi_str_replace(wd, parsed)
+        out = skarkix_multi_edit(wd, parsed)
         if out.get("returncode") == 0:
             for file_path, _, _ in parsed:
                 self.files_modified.add(file_path)
@@ -2249,119 +2547,9 @@ class CodingAgent:
             return False, msg
         return True, ""
 
-    def _dispatch_action(self, kind: str, payload: str, time_remaining: int | None) -> tuple[bool, str]:
-        """
-        Executes the parsed action (bash, edit, or multi_edit).
-        Returns: (should_stop, patch_or_summary_string)
-        - If should_stop is True and patch_or_summary_string is populated, it's a valid patch to return.
-        - If should_stop is True and patch_or_summary_string is empty, the agent is stuck in a loop and should break to emergency collection.
-        - If should_stop is False, patch_or_summary_string contains the summary of the command's outcome for logging.
-        """
-        if kind == "bash":
-            command = payload or ""
-
-            if SUBMISSION_SENTINEL in command:
-                print("[AGENT] Submission detected, executing to capture patch...")
-                output = self._execute_bash(command)
-                self.conversation.add("user", format_mini_observation(output, time_remaining=time_remaining))
-
-                full_output = output.get("stdout", "")
-                if output.get("stderr"):
-                    full_output += "\n" + output["stderr"]
-                extracted = check_submission(command, full_output)
-                auth = normalize_patch_text(authoritative_worktree_patch(self.executor))
-                patch = auth if auth.strip() else normalize_patch_text(extracted or "")
-
-                if patch and validate_patch_applies_cleanly(patch, self.config.working_dir):
-                    submit_ok, submit_msg = self._gate_submission_artifact(patch)
-                    if not submit_ok:
-                        print(f"[AGENT] Submission gate rejected patch: {submit_msg[:200]}")
-                        self.conversation.add(
-                            "user",
-                            f"Submission gate failed:\n\n{submit_msg}\n\n"
-                            "Fix the issue above, re-verify, then submit again.",
-                        )
-                        return False, ""
-                    ok, reason = _self_verify_patch(patch, self.config.working_dir)
-                    if not ok:
-                        print(f"[AGENT] Self-verify warning (accepting anyway): {reason[:200]}")
-                    print(f"[AGENT] Valid patch received ({len(patch)} chars)")
-                    return True, patch
-
-                if patch:
-                    print(f"[AGENT] Patch fails git apply --check ({len(patch)} chars)")
-                    self.conversation.add(
-                        "user",
-                        "The patch you submitted fails `git apply --check` against the repository "
-                        "baseline (wrong line numbers, missing context, or mixed unrelated edits). "
-                        "Re-read the current files from disk, make minimal edits, then re-run "
-                        "`git diff` and resubmit. Do not rely on remembered line numbers.",
-                    )
-                    return False, ""
-
-                print("[AGENT] Submission sentinel found but no patch in output")
-                self.conversation.add(
-                    "user",
-                    "The submission command ran but no patch was produced. Make sure your edits "
-                    "were saved and the files are tracked by git, then try again.",
-                )
-                return False, ""
-
-            # Loop detection on bash command signature.
-            signature = "bash:" + " ".join(command.split())
-            if self._stuck_in_loop(signature):
-                print(
-                    f"[AGENT] Detected command loop (same action {_LOOP_DETECT_REPEAT_THRESHOLD}x), "
-                    "breaking to emergency patch"
-                )
-                return True, ""
-
-            output = self._execute_bash(command)
-            if output.get("returncode") == 0 and any(
-                tok in command for tok in _MODIFYING_COMMAND_TOKENS
-            ):
-                diff_result = self.executor.execute("git diff --name-only 2>/dev/null")
-                if diff_result["returncode"] == 0 and diff_result["stdout"].strip():
-                    for filename in diff_result["stdout"].strip().splitlines():
-                        self.files_modified.add(filename)
-            self.conversation.add("user", format_mini_observation(output, time_remaining=time_remaining))
-
-        elif kind == "edit":
-            # Loop detection on edit signature (file + old_str length).
-            parsed = parse_edit_payload(payload or "")
-            sig_key = (
-                f"edit:{parsed[0]}:{len(parsed[1])}:{len(parsed[2])}"
-                if parsed
-                else "edit:malformed"
-            )
-            if self._stuck_in_loop(sig_key):
-                print("[AGENT] Detected edit loop, breaking to emergency patch")
-                return True, ""
-            output = self._execute_edit(payload or "")
-            self.conversation.add("user", format_mini_observation(output, time_remaining=time_remaining))
-
-        else:  # kind == "multi_edit"
-            # Loop detection on the set of (file, old_len) pairs.
-            parsed_multi = parse_multi_edit_payload(payload or "")
-            sig_key = (
-                "multi_edit:"
-                + ",".join(f"{f}:{len(o)}" for f, o, _ in parsed_multi)
-                if parsed_multi
-                else "multi_edit:malformed"
-            )
-            if self._stuck_in_loop(sig_key):
-                print("[AGENT] Detected multi_edit loop, breaking to emergency patch")
-                return True, ""
-            output = self._execute_multi_edit(payload or "")
-            self.conversation.add("user", format_mini_observation(output, time_remaining=time_remaining))
-
-        rc = output.get("returncode", -1)
-        out_len = len(output.get("stdout", "")) + len(output.get("stderr", ""))
-        return False, f"returncode={rc}, output={out_len} chars"
-
-    # --- Main loop ----------------------------------------------------------
 
     def run(self, problem_statement: str) -> str:
+        _clear_disk_fallback()
         self.start_time = time.time()
         self.step_count = 0
         self.problem_statement = problem_statement
@@ -2370,7 +2558,7 @@ class CodingAgent:
             self.config.working_dir = self._detect_working_dir()
             self.executor.working_dir = self.config.working_dir
 
-        print(f"[AGENT] Starting CodingAgent in {self.config.working_dir}")
+        print(f"[AGENT] Starting SkarkixAgent in {self.config.working_dir}")
         print(f"[AGENT] Planning Model: {self.config.planning_model}")
         print(f"[AGENT] Execution Model: {self.config.execution_model}")
         print(
@@ -2442,11 +2630,9 @@ class CodingAgent:
             self.step_count += 1
 
             wall_budget = _effective_agent_wall_sec()
-            time_remaining = None
             if wall_budget is not None and not pretimeout_fallback_attempted:
                 elapsed_pre = time.time() - self.start_time
                 remaining = wall_budget - elapsed_pre
-                time_remaining = max(int(remaining), 0)
                 if remaining <= _pretimeout_trigger_sec():
                     print(
                         f"[AGENT] Low on time (~{max(int(remaining), 0)}s left of ~{wall_budget:.0f}s budget), "
@@ -2509,7 +2695,7 @@ class CodingAgent:
                     self.conversation.add(
                         "user",
                         "[System reminder: Most of the time budget is used. If your fix is ready, "
-                        "submit NOW with exactly one ```rswea_bash_command``` block containing "
+                        "submit NOW with exactly one ```skarkix_shell``` block containing "
                         "`echo SUBMIT_PATCH && git -c color.ui=false -c core.pager=cat diff HEAD`. "
                         "Ending without SUBMIT_PATCH fails the run.",
                     )
@@ -2557,18 +2743,116 @@ class CodingAgent:
 
             consecutive_format_errors = 0
 
-            stop_loop, result = self._dispatch_action(kind, payload, time_remaining)
-            if stop_loop:
-                if result:
-                    return result  # Valid patch string
-                break  # Stuck in loop; break to emergency patch
+            if kind == "bash":
+                command = payload or ""
 
+                if SUBMISSION_SENTINEL in command:
+                    print("[AGENT] Submission detected, executing to capture patch...")
+                    output = self._execute_bash(command)
+                    self.conversation.add("user", format_mini_observation(output))
+
+                    full_output = output.get("stdout", "")
+                    if output.get("stderr"):
+                        full_output += "\n" + output["stderr"]
+                    extracted = check_submission(command, full_output)
+                    auth = normalize_patch_text(authoritative_worktree_patch(self.executor))
+                    patch = auth if auth.strip() else normalize_patch_text(extracted or "")
+                    
+                    wd = self.config.working_dir
+                    if patch and not validate_patch_applies_cleanly(patch, wd):
+                        repaired = validate_or_repair_patch(patch, wd)
+                        if repaired:
+                            patch = repaired
+                            print(f"[AGENT] Automatically repaired patch ({len(patch)} chars)")
+
+                    if patch and validate_patch_applies_cleanly(patch, wd):
+                        submit_ok, submit_msg = self._gate_submission_artifact(patch)
+                        if not submit_ok:
+                            print(f"[AGENT] Submission gate rejected patch: {submit_msg[:200]}")
+                            self.conversation.add(
+                                "user",
+                                f"Submission gate failed:\n\n{submit_msg}\n\n"
+                                "Fix the issue above, re-verify, then submit again.",
+                            )
+                            continue
+                        ok, reason = _self_verify_patch(patch, self.config.working_dir)
+                        if not ok:
+                            print(f"[AGENT] Self-verify warning (accepting anyway): {reason[:200]}")
+                        print(f"[AGENT] Valid patch received ({len(patch)} chars)")
+                        _atomic_write_text(_BEST_PATCH_DISK_PATH, patch)
+                        return patch
+
+                    if patch:
+                        print(f"[AGENT] Patch fails git apply --check ({len(patch)} chars)")
+                        self.conversation.add(
+                            "user",
+                            "The patch you submitted fails `git apply --check` against the repository "
+                            "baseline (wrong line numbers, missing context, or mixed unrelated edits). "
+                            "Re-read the current files from disk, make minimal edits, then re-run "
+                            "`git diff` and resubmit. Do not rely on remembered line numbers.",
+                        )
+                        continue
+
+                    print("[AGENT] Submission sentinel found but no patch in output")
+                    self.conversation.add(
+                        "user",
+                        "The submission command ran but no patch was produced. Make sure your edits "
+                        "were saved and the files are tracked by git, then try again.",
+                    )
+                    continue
+
+                signature = "bash:" + " ".join(command.split())
+                if self._stuck_in_loop(signature):
+                    print(
+                        f"[AGENT] Detected command loop (same action {_LOOP_DETECT_REPEAT_THRESHOLD}x), "
+                        "breaking to emergency patch"
+                    )
+                    break
+
+                output = self._execute_bash(command)
+                if output.get("returncode") == 0 and any(
+                    tok in command for tok in _MODIFYING_COMMAND_TOKENS
+                ):
+                    diff_result = self.executor.execute("git diff --name-only 2>/dev/null")
+                    if diff_result["returncode"] == 0 and diff_result["stdout"].strip():
+                        for filename in diff_result["stdout"].strip().splitlines():
+                            self.files_modified.add(filename)
+                self.conversation.add("user", format_mini_observation(output))
+
+            elif kind == "edit":
+                parsed = parse_edit_payload(payload or "")
+                sig_key = (
+                    f"edit:{parsed[0]}:{len(parsed[1])}:{len(parsed[2])}"
+                    if parsed
+                    else "edit:malformed"
+                )
+                if self._stuck_in_loop(sig_key):
+                    print("[AGENT] Detected edit loop, breaking to emergency patch")
+                    break
+                output = self._execute_edit(payload or "")
+                self.conversation.add("user", format_mini_observation(output))
+
+            else:  # kind == "multi_edit"
+                parsed_multi = parse_multi_edit_payload(payload or "")
+                sig_key = (
+                    "multi_edit:"
+                    + ",".join(f"{f}:{len(o)}" for f, o, _ in parsed_multi)
+                    if parsed_multi
+                    else "multi_edit:malformed"
+                )
+                if self._stuck_in_loop(sig_key):
+                    print("[AGENT] Detected multi_edit loop, breaking to emergency patch")
+                    break
+                output = self._execute_multi_edit(payload or "")
+                self.conversation.add("user", format_mini_observation(output))
+
+            rc = output.get("returncode", -1)
+            out_len = len(output.get("stdout", "")) + len(output.get("stderr", ""))
             print(
-                f"[AGENT] Step {self.step_count} complete: {result}, "
+                f"[AGENT] Step {self.step_count} complete: returncode={rc}, output={out_len} chars, "
                 f"conversation={self.conversation.total_chars()} chars"
             )
 
-        # --- Loop ended without submission ---
         print(f"[AGENT] Loop ended at step {self.step_count}/{self.config.max_steps}")
 
         patch = self._collect_patch_emergency()
@@ -2588,22 +2872,16 @@ class CodingAgent:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# Agent factory
-# ---------------------------------------------------------------------------
 
 
-def create_agent(problem_statement: str, config: AgentConfig | None = None) -> CodingAgent:
+def create_agent(problem_statement: str, config: AgentConfig | None = None) -> SkarkixAgent:
     """Return the coding agent (ridges-agent-style single-phase loop)."""
     _ = problem_statement  # reserved for future routing
     cfg = config or AgentConfig()
-    print("[AGENT] Selected: CodingAgent (ridges-agent workflow + apply_str_replace)")
-    return CodingAgent(config=cfg)
+    print("[AGENT] Selected: SkarkixAgent (ridges-agent workflow + skarkix_edit)")
+    return SkarkixAgent(config=cfg)
 
 
-# ---------------------------------------------------------------------------
-# Main Entry Point — the Ridges miner contract
-# ---------------------------------------------------------------------------
 
 
 def agent_main(input):
@@ -2641,18 +2919,14 @@ def agent_main(input):
         except Exception:
             patch = ""
 
-    if not patch or not patch.strip():
+    wd = (getattr(agent, "config", None) and agent.config.working_dir) or os.getcwd()
+    
+    patch = skarkix_finalize_patch(patch or "", wd)
+    
+    if not patch:
         print("[AGENT] WARNING: Returning empty patch")
         return ""
-
-    patch = normalize_patch_text(patch)
-    wd = (getattr(agent, "config", None) and agent.config.working_dir) or os.getcwd()
-
-    if not validate_patch_applies_cleanly(patch, wd):
-        print("[AGENT] WARNING: Final patch failed git apply --check; returning empty patch")
-        return ""
-
-    # Harbor checks against a tree at HEAD; reset so its preimage matches what we validated.
+        
     reset_worktree_to_head_for_harbor(wd)
 
     print(f"[AGENT] Returning patch: {len(patch)} characters")
@@ -2660,13 +2934,12 @@ def agent_main(input):
     return patch
 
 
-# Backward-compat: some callers import these names directly.
 __all__ = [
     "AgentConfig",
-    "CodingAgent",
+    "SkarkixAgent",
     "agent_main",
-    "apply_multi_str_replace",
-    "apply_str_replace",
+    "skarkix_multi_edit",
+    "skarkix_edit",
     "authoritative_worktree_patch",
     "check_submission",
     "create_agent",
@@ -2682,6 +2955,7 @@ __all__ = [
     "reset_worktree_to_head_for_harbor",
     "validate_patch",
     "validate_patch_applies_cleanly",
+    "validate_patch_with_git",
     "_extract_patch_paths",
     "_infer_test_path",
     "_diff_uses_callsite_clone_workaround",
