@@ -176,6 +176,7 @@ def inference(
     *,
     top_p: float | None = None,
     seed: int | None = None,
+    run_id: str | None = None,
 ):
     """Chat completion through the Chutes-compatible endpoint.
 
@@ -193,12 +194,18 @@ def inference(
         return None, None
 
     resolved = _resolve_model_for_local(model)
-    url = f"{_chutes_base_url()}/chat/completions"
+    proxy_url = os.getenv("SANDBOX_PROXY_URL")
+    if proxy_url:
+        url = f"{proxy_url.rstrip('/')}/agents/inference"
+    else:
+        url = f"{_chutes_base_url()}/chat/completions"
     payload: dict[str, Any] = {
         "model": resolved,
         "messages": _apply_prompt_cache_markers(messages),
         "temperature": temperature,
     }
+    if run_id:
+        payload["run_id"] = run_id
     if top_p is not None:
         payload["top_p"] = top_p
     if seed is not None:
@@ -299,94 +306,6 @@ def inference(
     return None, None
 
 
-def embedding(input):
-    """Embeddings through the Chutes-compatible endpoint."""
-    timeout = (LLM_CONNECT_TIMEOUT, min(LLM_READ_TIMEOUT, 120))
-    model = os.getenv("RIDGES_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
-    api_key = _chutes_api_key()
-    if not api_key:
-        print("[AGENT] embedding(): missing CHUTES_API_KEY")
-        return None
-
-    resolved = _resolve_embedding_for_local(model)
-    payload = {"model": resolved, "input": input}
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    url = f"{_chutes_base_url()}/embeddings"
-    print(f"[AGENT] embedding(): Chutes endpoint model={resolved}")
-
-    last_attempt = 4
-    attempt = 0
-    wait = 1.0
-    max_wait = 60.0
-    while attempt <= last_attempt:
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-            if response.status_code == 429 and attempt < last_attempt:
-                retry_after = response.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        time.sleep(float(retry_after))
-                    except ValueError:
-                        time.sleep(wait)
-                else:
-                    time.sleep(wait)
-                wait = min(wait * 2, max_wait)
-                print(f"[AGENT] embedding(): HTTP 429, retrying (attempt {attempt + 2}/5)...")
-                attempt += 1
-                continue
-            if response.status_code != 200:
-                retriable = response.status_code in (408, 425, 429, 500, 502, 503, 504)
-                if retriable and attempt < last_attempt:
-                    print(
-                        f"[AGENT] embedding(): HTTP {response.status_code}, retrying "
-                        f"(attempt {attempt + 2}/{last_attempt + 1})..."
-                    )
-                    _retry_sleep_after_rate_limit(attempt)
-                    attempt += 1
-                    continue
-                print(
-                    f"[AGENT] embedding(): failed status {response.status_code}: "
-                    f"{response.text[:500]}"
-                )
-                return None
-            data = response.json()
-            row = (data.get("data") or [{}])[0]
-            result = row.get("embedding")
-            if not isinstance(result, list):
-                print("[AGENT] embedding(): unexpected response shape")
-                return None
-            print(f"[AGENT] embedding(): Embedding response: {len(result)} dimensions")
-            return result
-        except requests.exceptions.Timeout as exc:
-            print(f"[AGENT] embedding(): Request timeout: {exc}")
-            if attempt < last_attempt:
-                _retry_sleep_after_rate_limit(attempt)
-                attempt += 1
-                continue
-            return None
-        except requests.exceptions.ConnectionError as exc:
-            print(f"[AGENT] embedding(): Connection error: {exc}")
-            if attempt < last_attempt:
-                _retry_sleep_after_rate_limit(attempt)
-                attempt += 1
-                continue
-            return None
-        except (ValueError, json.JSONDecodeError) as exc:
-            print(f"[AGENT] embedding(): Invalid JSON in response: {exc}")
-            return None
-        except Exception as e:
-            print(f"[AGENT] embedding(): Embedding request failed: {e}")
-            return None
-    return None
-
 
 
 PLANNING_MODEL = os.getenv("RIDGES_PLANNING_MODEL", "anthropic/claude-opus-4.7")
@@ -423,6 +342,7 @@ class AgentConfig:
         working_dir: Optional[str] = None,
         cost_limit: float = DEFAULT_COST_LIMIT,
         enable_planning: bool = True,
+        run_id: Optional[str] = None,
     ):
         exec_model = execution_model or model or DEFAULT_MODEL
         self.planning_model = planning_model
@@ -445,6 +365,7 @@ class AgentConfig:
         self.working_dir = working_dir
         self.cost_limit = cost_limit
         self.enable_planning = enable_planning
+        self.run_id = run_id
 
     @property
     def model(self) -> str:
@@ -2156,8 +2077,9 @@ import json as json_lib
 
 class TaskAnalyzer:
     # [SKARKIX CORE] Chain-of-thought analysis node.
-    def __init__(self, model: str):
+    def __init__(self, model: str, run_id: str | None = None):
         self._model = model
+        self._run_id = run_id
 
     def analyze(self, problem_statement: str) -> dict:
         messages = [
@@ -2167,7 +2089,7 @@ class TaskAnalyzer:
         
         for _ in range(3):
             try:
-                response, _ = inference(self._model, 0.0, messages)
+                response, _ = inference(self._model, 0.0, messages, run_id=self._run_id)
                 if response:
                     start = response.find("{")
                     end = response.rfind("}")
@@ -2195,7 +2117,7 @@ class SkarkixAgent:
             timeout=self.config.command_timeout,
             shell_prefix=_conda_prefix,
         )
-        self.analyzer = TaskAnalyzer(model=self.config.planning_model)
+        self.analyzer = TaskAnalyzer(model=self.config.planning_model, run_id=self.config.run_id)
         self.conversation = ContextWindowTracker(max_chars=self.config.max_conversation_chars)
         self.step_count = 0
         self.start_time: float = 0
@@ -2351,6 +2273,7 @@ class SkarkixAgent:
                 messages,
                 top_p=self.config.llm_top_p,
                 seed=self._llm_seed,
+                run_id=self.config.run_id,
             )
             if response is not None:
                 if usage and usage.get("total_tokens", 0) > 0:
@@ -2884,11 +2807,11 @@ def create_agent(problem_statement: str, config: AgentConfig | None = None) -> S
 
 
 
-def agent_main(input):
+def agent_main(input_dict: dict):
     """Entry point for the Ridges miner.
 
     Args:
-        input: dict with at least a 'problem_statement' key (from instruction.md).
+        input_dict: dict with at least a 'problem_statement' key (from instruction.md).
 
     Returns:
         A unified diff string (the patch), or an empty string on failure.
@@ -2896,10 +2819,11 @@ def agent_main(input):
     print("[AGENT] Entered agent_main()")
 
     problem_statement = (
-        input.get("problem_statement", "")
-        if isinstance(input, dict)
-        else str(input)
+        input_dict.get("problem_statement", "")
+        if isinstance(input_dict, dict)
+        else str(input_dict)
     )
+    run_id = input_dict.get("run_id") if isinstance(input_dict, dict) else None
     if not problem_statement:
         print("[AGENT] ERROR: Empty problem statement")
         return ""
@@ -2907,7 +2831,7 @@ def agent_main(input):
     print(f"[AGENT] Problem statement: {len(problem_statement)} characters")
     print(f"[AGENT] Problem preview: {problem_statement[:300]}...")
 
-    config = AgentConfig()
+    config = AgentConfig(run_id=run_id)
     agent = create_agent(problem_statement, config)
 
     try:
@@ -2925,13 +2849,13 @@ def agent_main(input):
     
     if not patch:
         print("[AGENT] WARNING: Returning empty patch")
-        return ""
+        return {"patch": ""}
         
     reset_worktree_to_head_for_harbor(wd)
 
     print(f"[AGENT] Returning patch: {len(patch)} characters")
     print(f"[AGENT] Patch preview:\n{patch[:500]}...")
-    return patch
+    return {"patch": patch}
 
 
 __all__ = [
@@ -2943,7 +2867,6 @@ __all__ = [
     "authoritative_worktree_patch",
     "check_submission",
     "create_agent",
-    "embedding",
     "format_mini_format_error",
     "format_mini_observation",
     "inference",
